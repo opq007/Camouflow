@@ -56,12 +56,18 @@ class ScenarioExecutor(
         scenario_path: Optional[Path] = None,
     ) -> None:
         profile_name = str(account_payload.get("name"))
-        camoufox_settings = account_payload.get("_camoufox_settings") or account_payload.get("camoufox_settings")
+        browser_engine = str(account_payload.get("_browser_engine") or "camoufox")
+        browser_settings = (
+            account_payload.get("_browser_settings")
+            or account_payload.get("_camoufox_settings")
+            or account_payload.get("camoufox_settings")
+        )
         super().__init__(
             profile_name=profile_name,
             proxy=proxy,
             keep_browser_open=keep_browser_open,
-            camoufox_settings=camoufox_settings,
+            browser_engine=browser_engine,
+            browser_settings=browser_settings,
         )
         self.scenario = scenario
         self.debug_session = debug_session

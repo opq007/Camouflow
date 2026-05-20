@@ -2,6 +2,8 @@ from typing import List, Tuple
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QFrame,
+    QGridLayout,
     QLabel,
     QVBoxLayout,
     QHBoxLayout,
@@ -17,6 +19,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.ui.icons import lucide_icon
 from app.ui.scenario_editor import ScenarioEditor
 from app.ui.style import create_card
 
@@ -49,55 +52,178 @@ ACTION_LABELS = {value: label for label, value in ACTION_OPTIONS_DIALOG}
 
 def build_scenarios_tab(main) -> QWidget:
     tab = QWidget()
+    tab.setObjectName("PageViewport")
     scenario_layout = QVBoxLayout(tab)
-    scenario_layout.setContentsMargins(6, 6, 6, 6)
-    scenario_layout.setSpacing(18)
+    scenario_layout.setContentsMargins(0, 0, 0, 0)
+    scenario_layout.setSpacing(0)
 
-    scenario_top = QHBoxLayout()
-    scenario_top.setSpacing(18)
-    scenario_list_card, scenario_list_layout, _ = create_card(tab, "Scenario library")
+    content = QHBoxLayout()
+    content.setContentsMargins(0, 0, 0, 0)
+    content.setSpacing(0)
+    scenario_layout.addLayout(content, 1)
+
+    left_panel = QFrame(tab)
+    left_panel.setObjectName("scenarioLeftPanel")
+    left_panel.setFixedWidth(280)
+    left_layout = QVBoxLayout(left_panel)
+    left_layout.setContentsMargins(16, 16, 14, 16)
+    left_layout.setSpacing(14)
+
+    scenario_title = QLabel("Scenario library", left_panel)
+    scenario_title.setProperty("class", "cardTitle")
+    left_layout.addWidget(scenario_title)
+
     main.scenario_list_widget = QListWidget()
+    main.scenario_list_widget.setObjectName("scenarioLibrary")
     main.scenario_list_widget.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
     main.scenario_list_widget.itemSelectionChanged.connect(main._on_scenario_selected)
     main.scenario_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
     main.scenario_list_widget.customContextMenuRequested.connect(main._show_scenario_context_menu)
-    scenario_list_layout.addWidget(main.scenario_list_widget, 1)
-    scenario_buttons = QHBoxLayout()
+    main.scenario_list_widget.setMinimumHeight(170)
+    left_layout.addWidget(main.scenario_list_widget)
+
+    scenario_buttons = QGridLayout()
+    scenario_buttons.setHorizontalSpacing(8)
+    scenario_buttons.setVerticalSpacing(8)
     btn_new_scenario = QPushButton("New")
+    btn_new_scenario.setProperty("class", "ghost")
     btn_new_scenario.clicked.connect(main._new_scenario)
     btn_load_scenario = QPushButton("Load")
+    btn_load_scenario.setProperty("class", "ghost")
     btn_load_scenario.clicked.connect(main._load_selected_scenario)
     btn_save_scenario = QPushButton("Save")
+    btn_save_scenario.setIcon(lucide_icon("save"))
+    btn_save_scenario.setProperty("class", "success")
     btn_save_scenario.clicked.connect(main._save_scenario)
     btn_duplicate_scenario = QPushButton("Duplicate")
+    btn_duplicate_scenario.setProperty("class", "ghost")
     btn_duplicate_scenario.clicked.connect(main._duplicate_selected_scenario)
     btn_delete_scenario = QPushButton("Delete")
+    btn_delete_scenario.setProperty("class", "danger")
     btn_delete_scenario.clicked.connect(main._delete_selected_scenario)
-    scenario_buttons.addWidget(btn_new_scenario)
-    scenario_buttons.addWidget(btn_load_scenario)
-    scenario_buttons.addWidget(btn_save_scenario)
-    scenario_buttons.addWidget(btn_duplicate_scenario)
-    scenario_buttons.addWidget(btn_delete_scenario)
-    scenario_list_layout.addLayout(scenario_buttons)
-    scenario_top.addWidget(scenario_list_card, 1)
+    scenario_buttons.addWidget(btn_new_scenario, 0, 0)
+    scenario_buttons.addWidget(btn_load_scenario, 0, 1)
+    scenario_buttons.addWidget(btn_save_scenario, 1, 0)
+    scenario_buttons.addWidget(btn_duplicate_scenario, 1, 1)
+    scenario_buttons.addWidget(btn_delete_scenario, 2, 0, 1, 2)
+    left_layout.addLayout(scenario_buttons)
 
-    details_card, scenario_editor_layout, _ = create_card(tab, "Details")
-    name_row = QHBoxLayout()
-    name_row.addWidget(QLabel("Name:"))
+    templates_title = QLabel("Action Templates", left_panel)
+    templates_title.setProperty("class", "cardTitle")
+    left_layout.addWidget(templates_title)
+    template_specs = [
+        ("🌐", "Navigate", "goto", "goto"),
+        ("👆", "Click", "click", "click"),
+        ("⌨", "Type Text", "type", "type"),
+        ("⏱", "Wait", "wait", "sleep"),
+        ("📡", "HTTP Request", "fetch", "http_request"),
+        ("🗂", "Tab Control", "tab", "new_tab"),
+        ("💾", "Variable", "var", "set_var"),
+        ("?", "Condition", "condition", "compare"),
+    ]
+    for icon, label, fn_name, action in template_specs:
+        btn = QPushButton(f"{icon}  {label}\n     {fn_name}()", left_panel)
+        btn.setObjectName("templateButton")
+        btn.clicked.connect(
+            lambda _, value=action: main._insert_step(
+                len(main.current_steps),
+                {"action": value, "_no_default_links": True, "_ok_links": [], "_err_links": []},
+            )
+        )
+        left_layout.addWidget(btn)
+    left_layout.addStretch(1)
+    content.addWidget(left_panel)
+
+    center_panel = QFrame(tab)
+    center_panel.setObjectName("scenarioCenterPanel")
+    center_layout = QVBoxLayout(center_panel)
+    center_layout.setContentsMargins(0, 0, 0, 0)
+    center_layout.setSpacing(0)
+    map_header = QFrame(center_panel)
+    map_header.setObjectName("scenarioMapHeader")
+    map_header_layout = QHBoxLayout(map_header)
+    map_header_layout.setContentsMargins(22, 14, 22, 14)
+    action_map_title = QLabel("Action Map", map_header)
+    action_map_title.setProperty("class", "sectionTitle")
+    map_header_layout.addWidget(action_map_title, 1)
+    map_save_btn = QPushButton("Save", map_header)
+    map_save_btn.setIcon(lucide_icon("save"))
+    map_save_btn.setProperty("class", "ghost")
+    map_save_btn.clicked.connect(main._save_scenario)
+    map_header_layout.addWidget(map_save_btn)
+    map_run_btn = QPushButton("Run Scenario", map_header)
+    map_run_btn.setIcon(lucide_icon("play", "#ffffff"))
+    map_run_btn.setProperty("class", "primary")
+    map_run_btn.clicked.connect(main.start_selected_scenario)
+    map_header_layout.addWidget(map_run_btn)
+    center_layout.addWidget(map_header)
+
+    main.map_view = ScenarioEditor()
+    main.map_view.set_action_labels(ACTION_LABELS)
+    main.map_view.on_select = main._on_map_select
+    main.map_view.on_add_after = main._on_map_add_after
+    main.map_view.on_move = main._on_map_move
+    main.map_view.on_drag_end = main._on_map_drag_end
+    main.map_view.on_edit = main._on_map_edit
+    main.map_view.on_delete = main._on_map_delete
+    main.map_view.on_add_detached = main._on_map_add_detached
+    center_layout.addWidget(main.map_view, 1)
+    content.addWidget(center_panel, 1)
+
+    right_panel = QFrame(tab)
+    right_panel.setObjectName("scenarioRightPanel")
+    right_panel.setFixedWidth(330)
+    right_layout = QVBoxLayout(right_panel)
+    right_layout.setContentsMargins(22, 22, 18, 18)
+    right_layout.setSpacing(14)
+    details_title = QLabel("Details", right_panel)
+    details_title.setProperty("class", "cardTitle")
+    right_layout.addWidget(details_title)
+
+    name_label = QLabel("Name:", right_panel)
+    name_label.setProperty("class", "muted")
+    right_layout.addWidget(name_label)
     main.scenario_name_input = QLineEdit()
-    name_row.addWidget(main.scenario_name_input)
-    name_row.addWidget(QLabel("Description:"))
+    right_layout.addWidget(main.scenario_name_input)
+    desc_label = QLabel("Description:", right_panel)
+    desc_label.setProperty("class", "muted")
+    right_layout.addWidget(desc_label)
     main.scenario_description_input = QLineEdit()
-    name_row.addWidget(main.scenario_description_input)
-    scenario_editor_layout.addLayout(name_row)
+    right_layout.addWidget(main.scenario_description_input)
 
-    vars_row = QHBoxLayout()
-    vars_row.addWidget(QLabel("Variables in scenario:"))
+    vars_label = QLabel("Variables in scenario:", right_panel)
+    vars_label.setProperty("class", "cardTitle")
+    right_layout.addWidget(vars_label)
     main.vars_list = QListWidget()
-    main.vars_list.setMinimumHeight(80)
-    vars_row.addWidget(main.vars_list, 1)
-    scenario_editor_layout.addLayout(vars_row)
-    scenario_top.addWidget(details_card, 2)
+    main.vars_list.setObjectName("variablesList")
+    right_layout.addWidget(main.vars_list)
+    add_var_btn = QPushButton("＋  Add Variable", right_panel)
+    add_var_btn.setProperty("class", "ghost")
+    right_layout.addWidget(add_var_btn)
+    props_label = QLabel("Node Properties", right_panel)
+    props_label.setProperty("class", "cardTitle")
+    right_layout.addWidget(props_label)
+    props_empty = QLabel("Select a node to edit its properties", right_panel)
+    props_empty.setObjectName("nodePropertiesEmpty")
+    props_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    props_empty.setProperty("class", "muted")
+    props_empty.setMinimumHeight(110)
+    right_layout.addWidget(props_empty)
+    right_layout.addStretch(1)
+    total_card = QFrame(right_panel)
+    total_card.setObjectName("totalStepsCard")
+    total_layout = QHBoxLayout(total_card)
+    total_layout.setContentsMargins(14, 12, 14, 12)
+    total_badge = QLabel("0", total_card)
+    total_badge.setObjectName("totalStepsBadge")
+    total_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    main.scenario_total_steps_label = total_badge
+    total_layout.addWidget(total_badge)
+    total_text = QLabel("Total Steps\nin this scenario", total_card)
+    total_text.setProperty("class", "muted")
+    total_layout.addWidget(total_text, 1)
+    right_layout.addWidget(total_card)
+    content.addWidget(right_panel)
 
     # Hidden container keeps logic-only widgets parented so they don't pop as floating windows
     hidden_container = QWidget(tab)
@@ -295,21 +421,6 @@ def build_scenarios_tab(main) -> QWidget:
     form.addRow(*main.row_jump_found)
     hidden_layout.addLayout(form)
 
-    # Action map fills most space
-    scenario_layout.addLayout(scenario_top)
-    map_card, map_layout, _ = create_card(tab, "Action map")
-    main.map_view = ScenarioEditor()
-    main.map_view.set_action_labels(ACTION_LABELS)
-    main.map_view.setMinimumHeight(420)
-    main.map_view.on_select = main._on_map_select
-    main.map_view.on_add_after = main._on_map_add_after
-    main.map_view.on_move = main._on_map_move
-    main.map_view.on_drag_end = main._on_map_drag_end
-    main.map_view.on_edit = main._on_map_edit
-    main.map_view.on_delete = main._on_map_delete
-    main.map_view.on_add_detached = main._on_map_add_detached
-    map_layout.addWidget(main.map_view, 1)
-    scenario_layout.addWidget(map_card, 1)
     scenario_layout.addWidget(hidden_container)
 
     return tab

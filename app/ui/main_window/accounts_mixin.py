@@ -44,6 +44,7 @@ from app.storage.db import (
     clear_profile_cookies,
     db_add_account,
     db_delete_account,
+    db_get_browser_engine,
     db_get_accounts,
     db_get_scenario,
     db_update_account,
@@ -51,6 +52,7 @@ from app.storage.db import (
     delete_profile_for_account,
     profile_dir_for_email,
 )
+from app.core.browser_interface import cloakbrowser_profile_dir, load_or_create_cloakbrowser_seed
 
 
 class AccountsMixin:
@@ -142,7 +144,17 @@ class AccountsMixin:
             # show parsed variables (short) inline
             parsed_preview = []
             for key, val in acc.items():
-                if key in {"stage", "proxy_host", "proxy_port", "proxy_user", "proxy_password", "extra_fields", "name", "camoufox_settings"}:
+                if key in {
+                    "stage",
+                    "proxy_host",
+                    "proxy_port",
+                    "proxy_user",
+                    "proxy_password",
+                    "extra_fields",
+                    "name",
+                    "camoufox_settings",
+                    "cloakbrowser_settings",
+                }:
                     continue
                 if val:
                     parsed_preview.append(f"{key}={val}")
@@ -157,8 +169,14 @@ class AccountsMixin:
             self.profile_count_label.setText(f"{len(snapshot)} profiles")
         if hasattr(self, "profile_status_label"):
             self.profile_status_label.setText(f"{undefined} undefined")
+        if hasattr(self, "profile_running_label"):
+            self.profile_running_label.setText(str(len(getattr(self, "live_browsers", {}) or {})))
         self._apply_accounts_filter()
         self._refresh_delete_tag_combo()
+        if hasattr(self, "_refresh_dashboard"):
+            self._refresh_dashboard()
+        if hasattr(self, "_refresh_cookies_profile_list"):
+            self._refresh_cookies_profile_list()
 
     def _refresh_delete_tag_combo(self) -> None:
         combo = getattr(self, "delete_tag_combo", None)
@@ -596,7 +614,7 @@ class AccountsMixin:
             self.log(f"No profile data to clear for {account_name}")
 
     def _camoufox_ui_values_for_account(self, acc: Dict[str, object]) -> Dict[str, object]:
-        return dict(self._camoufox_settings_for_account(acc))
+        return dict(self._browser_settings_for_account(acc))
 
     @staticmethod
     def _cookie_key(cookie: Dict[str, object]) -> Tuple[str, str, str]:
@@ -633,6 +651,36 @@ class AccountsMixin:
                 await ctx.__aexit__(None, None, None)
 
         return asyncio.run(_run())
+
+    def _fetch_profile_cookies_via_cloakbrowser(self, account_name: str) -> List[Dict[str, object]]:
+        import asyncio
+
+        async def _run() -> List[Dict[str, object]]:
+            try:
+                from cloakbrowser import launch_persistent_context_async
+            except Exception as exc:
+                raise RuntimeError("CloakBrowser is not installed. Run: pip install -r requirements.txt") from exc
+
+            profile_root = profile_dir_for_email(account_name)
+            user_data_dir = cloakbrowser_profile_dir(profile_root)
+            seed = load_or_create_cloakbrowser_seed(profile_root)
+            ctx = await launch_persistent_context_async(
+                str(user_data_dir),
+                headless=True,
+                args=[f"--fingerprint={seed}"],
+            )
+            try:
+                cookies = await ctx.cookies()
+                return [dict(c) for c in (cookies or [])]
+            finally:
+                await ctx.close()
+
+        return asyncio.run(_run())
+
+    def _fetch_profile_cookies(self, account_name: str) -> List[Dict[str, object]]:
+        if str(getattr(self, "browser_engine", db_get_browser_engine())) == "cloakbrowser":
+            return self._fetch_profile_cookies_via_cloakbrowser(account_name)
+        return self._fetch_profile_cookies_via_camoufox(account_name)
 
     def _write_profile_cookies_via_camoufox(self, account_name: str, cookies: List[Dict[str, object]]) -> None:
         import asyncio
@@ -675,6 +723,10 @@ class AccountsMixin:
                     for key in ("expires", "httpOnly", "secure", "sameSite"):
                         if key in cookie:
                             item[key] = cookie.get(key)
+                    if "expires" not in item:
+                        item["expires"] = int(
+                            (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)).timestamp()
+                        )
                     payload.append(item)
                 if payload:
                     await context.add_cookies(payload)
@@ -682,6 +734,62 @@ class AccountsMixin:
                 await ctx.__aexit__(None, None, None)
 
         asyncio.run(_run())
+
+    def _write_profile_cookies_via_cloakbrowser(self, account_name: str, cookies: List[Dict[str, object]]) -> None:
+        import asyncio
+
+        async def _run() -> None:
+            try:
+                from cloakbrowser import launch_persistent_context_async
+            except Exception as exc:
+                raise RuntimeError("CloakBrowser is not installed. Run: pip install -r requirements.txt") from exc
+
+            profile_root = profile_dir_for_email(account_name)
+            user_data_dir = cloakbrowser_profile_dir(profile_root)
+            seed = load_or_create_cloakbrowser_seed(profile_root)
+            ctx = await launch_persistent_context_async(
+                str(user_data_dir),
+                headless=True,
+                args=[f"--fingerprint={seed}"],
+            )
+            try:
+                await ctx.clear_cookies()
+                payload: List[Dict[str, object]] = []
+                for cookie in cookies or []:
+                    if not isinstance(cookie, dict):
+                        continue
+                    name = str(cookie.get("name") or "").strip()
+                    value = str(cookie.get("value") or "")
+                    domain = str(cookie.get("domain") or "").strip()
+                    path = str(cookie.get("path") or "/").strip() or "/"
+                    if not name or not domain:
+                        continue
+                    item: Dict[str, object] = {
+                        "name": name,
+                        "value": value,
+                        "domain": domain,
+                        "path": path,
+                    }
+                    for key in ("expires", "httpOnly", "secure", "sameSite"):
+                        if key in cookie:
+                            item[key] = cookie[key]
+                    if "expires" not in item:
+                        item["expires"] = int(
+                            (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)).timestamp()
+                        )
+                    payload.append(item)
+                if payload:
+                    await ctx.add_cookies(payload)
+            finally:
+                await ctx.close()
+
+        asyncio.run(_run())
+
+    def _write_profile_cookies(self, account_name: str, cookies: List[Dict[str, object]]) -> None:
+        if str(getattr(self, "browser_engine", db_get_browser_engine())) == "cloakbrowser":
+            self._write_profile_cookies_via_cloakbrowser(account_name, cookies)
+            return
+        self._write_profile_cookies_via_camoufox(account_name, cookies)
 
     @staticmethod
     def _format_cookie_expiry(value: object, source: str) -> str:
@@ -896,7 +1004,7 @@ class AccountsMixin:
         vars_container_layout.addStretch()
         tabs.addTab(vars_tab, "Variables")
 
-        # Camoufox tab
+        # Browser tab
         cam_tab = QWidget(tabs)
         cam_layout = QVBoxLayout(cam_tab)
         cam_scroll = QScrollArea(cam_tab)
@@ -909,6 +1017,9 @@ class AccountsMixin:
         cam_info.setWordWrap(True)
         cam_container_layout.addWidget(cam_info)
         cam_controls, cam_tabs_widget = self._build_camoufox_controls(dlg)
+        engine_control = cam_controls.get("browser_engine")
+        if engine_control is not None:
+            engine_control.setEnabled(False)
         cam_actions = QHBoxLayout()
         cam_actions.addStretch(1)
         cam_container_layout.addLayout(cam_actions)
@@ -921,11 +1032,11 @@ class AccountsMixin:
         effective_values = self._camoufox_ui_values_for_account(acc)
         self._apply_camoufox_controls(cam_controls, effective_values)
         def clear_camoufox_override() -> None:
-            self._apply_camoufox_controls(cam_controls, getattr(self, "camoufox_defaults", {}))
+            self._apply_camoufox_controls(cam_controls, self._active_browser_defaults())
 
         cam_defaults_btn.clicked.connect(clear_camoufox_override)
         cam_container_layout.addStretch()
-        tabs.addTab(cam_tab, "Camoufox")
+        tabs.addTab(cam_tab, "Browser")
 
         # Cookies tab
         cookies_tab = QWidget(tabs)
@@ -1001,7 +1112,7 @@ class AccountsMixin:
                 secure_text = "Yes" if cookie.get("secure") else ""
                 http_only_text = "Yes" if cookie.get("httpOnly") else ""
                 same_site = str(cookie.get("sameSite") or "")
-                source = str(cookie.get("source") or "camoufox")
+                source = str(cookie.get("source") or getattr(self, "browser_engine", "camoufox"))
                 values = [
                     domain,
                     name,
@@ -1043,7 +1154,7 @@ class AccountsMixin:
         def load_cookies_async() -> None:
             def run() -> None:
                 try:
-                    cookies = self._fetch_profile_cookies_via_camoufox(account_name)
+                    cookies = self._fetch_profile_cookies(account_name)
                 except Exception as exc:
                     cookies = []
 
@@ -1217,7 +1328,7 @@ class AccountsMixin:
 
             def run() -> None:
                 try:
-                    self._write_profile_cookies_via_camoufox(account_name, cookies_state)
+                    self._write_profile_cookies(account_name, cookies_state)
                 except Exception as exc:
                     def fail() -> None:
                         _set_cookies_busy(False)
@@ -1253,15 +1364,18 @@ class AccountsMixin:
             except Exception as exc:
                 QMessageBox.warning(self, "Error", f"Cannot update account: {exc}")
                 return
-            # Save camoufox overrides (if changed from defaults).
+            # Save browser overrides for the active engine (if changed from defaults).
             try:
                 overrides = self._collect_camoufox_controls(cam_controls)
-                if overrides == getattr(self, "camoufox_defaults", overrides):
-                    db_update_account(new_name, {"__delete_keys__": ["camoufox_settings"]})
+                engine = str(getattr(self, "browser_engine", "camoufox"))
+                settings_key = "cloakbrowser_settings" if engine == "cloakbrowser" else "camoufox_settings"
+                defaults = self._active_browser_defaults()
+                if overrides == defaults:
+                    db_update_account(new_name, {"__delete_keys__": [settings_key]})
                 else:
-                    db_update_account(new_name, {"camoufox_settings": overrides})
+                    db_update_account(new_name, {settings_key: overrides})
             except Exception as exc:
-                QMessageBox.warning(self, "Error", f"Cannot save Camoufox settings: {exc}")
+                QMessageBox.warning(self, "Error", f"Cannot save browser settings: {exc}")
                 return
             if new_name != account_name:
                 self._rename_proxy_assignment(account_name, new_name)
@@ -1298,12 +1412,15 @@ class AccountsMixin:
             QMessageBox.warning(self, "Error", f"Account {account_name} not found")
             return
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Camoufox settings · {account_name}")
+        dlg.setWindowTitle(f"Browser settings · {account_name}")
         layout = QVBoxLayout(dlg)
         info = QLabel("Override defaults for this profile. Leave values as default to inherit global settings.")
         info.setWordWrap(True)
         layout.addWidget(info)
         controls, tabs_widget = self._build_camoufox_controls(dlg)
+        engine_control = controls.get("browser_engine")
+        if engine_control is not None:
+            engine_control.setEnabled(False)
         layout.addWidget(tabs_widget)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
@@ -1317,25 +1434,30 @@ class AccountsMixin:
         def save_override():
             overrides = self._collect_camoufox_controls(controls)
             try:
-                if overrides == getattr(self, "camoufox_defaults", overrides):
-                    db_update_account(account_name, {"__delete_keys__": ["camoufox_settings"]})
+                engine = str(getattr(self, "browser_engine", "camoufox"))
+                settings_key = "cloakbrowser_settings" if engine == "cloakbrowser" else "camoufox_settings"
+                defaults = self._active_browser_defaults()
+                if overrides == defaults:
+                    db_update_account(account_name, {"__delete_keys__": [settings_key]})
                 else:
-                    db_update_account(account_name, {"camoufox_settings": overrides})
+                    db_update_account(account_name, {settings_key: overrides})
             except Exception as exc:
                 QMessageBox.warning(self, "Error", f"Cannot save settings: {exc}")
                 return
             self.refresh_accounts_list()
-            self.log(f"Camoufox settings updated for {account_name}")
+            self.log(f"Browser settings updated for {account_name}")
             dlg.accept()
 
         def clear_override():
             try:
-                db_update_account(account_name, {"__delete_keys__": ["camoufox_settings"]})
+                engine = str(getattr(self, "browser_engine", "camoufox"))
+                settings_key = "cloakbrowser_settings" if engine == "cloakbrowser" else "camoufox_settings"
+                db_update_account(account_name, {"__delete_keys__": [settings_key]})
             except Exception as exc:
                 QMessageBox.warning(self, "Error", f"Cannot reset settings: {exc}")
                 return
             self.refresh_accounts_list()
-            self.log(f"Camoufox settings reset for {account_name}")
+            self.log(f"Browser settings reset for {account_name}")
             dlg.accept()
 
         buttons.accepted.connect(save_override)

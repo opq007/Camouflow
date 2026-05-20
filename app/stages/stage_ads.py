@@ -21,7 +21,14 @@ class StageAds(BrowserInterface):
         keep_browser_open: bool = True,
         profile_name: Optional[str] = None,
     ):
-        super().__init__(login, password, auth2, proxy, keep_browser_open, profile_name=profile_name)
+        super().__init__(
+            profile_name=profile_name or login or "profile",
+            proxy=proxy,
+            keep_browser_open=keep_browser_open,
+        )
+        self.login = login
+        self.password = password
+        self.auth2 = auth2
         self.ads_url = ads_url
         self.video_headline = video_headline
         self.video_description = video_description

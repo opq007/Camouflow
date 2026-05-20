@@ -11,14 +11,23 @@ ROOT = Path(SPECPATH).resolve()
 datas = [
     (str(ROOT / "logo.ico"), "."),
     (str(ROOT / "scenaries"), "scenaries"),
+    (str(ROOT / "app" / "qml"), "app/qml"),
 ]
 
 datas += collect_data_files("browserforge")
 hiddenimports = collect_submodules("browserforge")
+hiddenimports += [
+    "PyQt6.QtQml",
+    "PyQt6.QtQuick",
+]
 
 # camoufox ships non-.py assets (e.g. YAML manifests) that must be bundled.
 datas += collect_data_files("camoufox")
 hiddenimports += collect_submodules("camoufox")
+
+# CloakBrowser ships helper modules and metadata for its Chromium downloader.
+datas += collect_data_files("cloakbrowser")
+hiddenimports += collect_submodules("cloakbrowser")
 
 # language_tags ships JSON indexes under language_tags/data/json.
 datas += collect_data_files("language_tags")

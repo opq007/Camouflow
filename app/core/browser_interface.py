@@ -13,17 +13,53 @@ from contextlib import contextmanager
 from pathlib import Path
 import urllib.request
 import urllib.parse
-from typing import Callable, Dict, List, Optional, Sequence, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, cast
 
 import socks
 
 from camoufox import AsyncCamoufox
 from camoufox.webgl.sample import sample_webgl
-from camoufox.utils import launch_options
-from app.storage.db import db_get_camoufox_defaults, profile_dir_for_email
+from app.storage.db import (
+    db_get_browser_engine,
+    db_get_camoufox_defaults,
+    db_get_cloakbrowser_defaults,
+    profile_dir_for_email,
+)
 from .camoufox_profile_fingerprint import load_or_create_profile_fingerprint_bundle
 from .locale_mapping import country_to_locale
 from .proxy_utils import LocalSocksProxyServer, ProxyDetails, parse_proxy
+
+
+BROWSER_ENGINE_CAMOUFOX = "camoufox"
+BROWSER_ENGINE_CLOAKBROWSER = "cloakbrowser"
+
+
+def normalize_browser_engine(engine: Optional[str]) -> str:
+    normalized = str(engine or "").strip().lower()
+    if normalized in {BROWSER_ENGINE_CAMOUFOX, BROWSER_ENGINE_CLOAKBROWSER}:
+        return normalized
+    return BROWSER_ENGINE_CAMOUFOX
+
+
+def cloakbrowser_profile_dir(profile_dir: Path) -> Path:
+    return Path(profile_dir) / BROWSER_ENGINE_CLOAKBROWSER
+
+
+def load_or_create_cloakbrowser_seed(profile_dir: Path) -> int:
+    path = Path(profile_dir) / "cloakbrowser_fingerprint.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+        seed = int(data.get("seed"))
+        if 10_000 <= seed <= 99_999_999:
+            if path.read_bytes().startswith(b"\xef\xbb\xbf"):
+                path.write_text(json.dumps({"seed": seed}, ensure_ascii=False, indent=2), encoding="utf-8")
+            return seed
+    except Exception:
+        pass
+    seed = random.randint(10_000, 99_999_999)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"seed": seed}, ensure_ascii=False, indent=2), encoding="utf-8")
+    return seed
 
 
 class BrowserInterface:
@@ -82,14 +118,22 @@ class BrowserInterface:
         proxy: str = "",
         keep_browser_open: bool = True,
         camoufox_settings: Optional[Dict[str, object]] = None,
+        browser_engine: Optional[str] = None,
+        browser_settings: Optional[Dict[str, object]] = None,
     ) -> None:
         self.profile_name = profile_name
         self.proxy = proxy
         self.keep_browser_open = keep_browser_open
-        self.user_data_dir = profile_dir_for_email(self.profile_name)
+        self.profile_root = profile_dir_for_email(self.profile_name)
+        self.browser_engine = normalize_browser_engine(browser_engine or db_get_browser_engine())
+        self.user_data_dir = self.profile_root
+        if self.browser_engine == BROWSER_ENGINE_CLOAKBROWSER:
+            self.user_data_dir = cloakbrowser_profile_dir(self.profile_root)
         os.makedirs(self.user_data_dir, exist_ok=True)
-        self._camoufox_settings = camoufox_settings or {}
+        self._browser_settings = browser_settings if browser_settings is not None else (camoufox_settings or {})
+        self._camoufox_settings = self._browser_settings
         self._camoufox_defaults = db_get_camoufox_defaults()
+        self._cloakbrowser_defaults = db_get_cloakbrowser_defaults()
 
         self.logger = logging.LoggerAdapter(logging.getLogger(__name__), {"profile": self.profile_name})
         self._proxy_logger = self._init_proxy_logger()
@@ -105,6 +149,7 @@ class BrowserInterface:
         self._ready_callbacks: List[Callable[[], None]] = []
         self._ready_notified = False
         self._camoufox_ctx: Optional[AsyncCamoufox] = None
+        self._cloakbrowser_context = None
         self._proxy_config, self._proxy_details = parse_proxy(proxy, profile_name=self.profile_name)
         if proxy and not self._proxy_config:
             msg = f"Proxy string provided for {self.profile_name} but failed to parse; proxy disabled"
@@ -120,8 +165,11 @@ class BrowserInterface:
             log_path = os.path.join(os.getcwd(), "logs", "proxy.log")
             os.makedirs(os.path.dirname(log_path), exist_ok=True)
             handler = logging.FileHandler(log_path, encoding="utf-8")
-            fmt = logging.Formatter("%(asctime)s %(levelname)s [%(profile)s] %(message)s")
+            from app.utils.gui_logging import PROFILE_FILTER, ProfileFormatter
+
+            fmt = ProfileFormatter("%(asctime)s %(levelname)s [%(profile)s] %(message)s")
             handler.setFormatter(fmt)
+            handler.addFilter(PROFILE_FILTER)
             proxy_logger.addHandler(handler)
         proxy_logger.propagate = True
         return logging.LoggerAdapter(proxy_logger, {"profile": self.profile_name})
@@ -259,17 +307,19 @@ class BrowserInterface:
             logger=self.logger,
         )
 
+        persistent_context_value = bool(merged.get("persistent_context", True))
         kwargs = {
             "headless": headless_value,
             "humanize": humanize_arg,
             "locale": locale_value,
             "proxy": proxy_for_launch,
-            "persistent_context": bool(merged.get("persistent_context", True)),
-            "user_data_dir": str(self.user_data_dir),
+            "persistent_context": persistent_context_value,
             "enable_cache": bool(merged.get("enable_cache", True)),
-            "i_know_what_im_doing": False,
+            "i_know_what_im_doing": True,
             "fingerprint": fp,
         }
+        if persistent_context_value:
+            kwargs["user_data_dir"] = str(self.user_data_dir)
 
         def _normalize_locale_list(locale_str: str) -> List[str]:
             raw = (locale_str or "").strip()
@@ -441,6 +491,120 @@ class BrowserInterface:
             kwargs["config"] = config_overrides
         return kwargs
 
+    def _split_setting_list(self, value: object) -> List[str]:
+        if isinstance(value, str):
+            parts = []
+            for chunk in value.replace("\r", "\n").replace(",", "\n").split("\n"):
+                chunk = chunk.strip()
+                if chunk:
+                    parts.append(chunk)
+            return parts
+        if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return []
+
+    def _browser_headless_value(self, raw: object) -> bool:
+        if isinstance(raw, bool):
+            return raw
+        value = str(raw or "").strip().lower()
+        if value in {"1", "true", "yes", "headless", "virtual"}:
+            return True
+        return False
+
+    @staticmethod
+    def _positive_int(raw: object, default: int = 0) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    def _build_cloakbrowser_launch_kwargs(self) -> Dict[str, object]:
+        merged = dict(self._cloakbrowser_defaults or {})
+        merged.update({k: v for k, v in (self._browser_settings or {}).items() if v is not None})
+
+        locale_raw = str(merged.get("locale") or "").strip() or self._detect_browser_locale()
+        locale_value = self._normalize_locale_token(locale_raw) or "en-US"
+        timezone_value = str(merged.get("timezone") or "").strip() or self._detect_browser_timezone()
+
+        fingerprint_seed = self._positive_int(merged.get("fingerprint_seed"))
+        if not fingerprint_seed:
+            fingerprint_seed = load_or_create_cloakbrowser_seed(self.profile_root)
+        args = [f"--fingerprint={fingerprint_seed}"]
+
+        platform = str(merged.get("platform") or "").strip().lower()
+        if platform in {"windows", "macos", "linux"}:
+            args.append(f"--fingerprint-platform={platform}")
+
+        gpu_vendor = str(merged.get("gpu_vendor") or "").strip()
+        if gpu_vendor:
+            args.append(f"--fingerprint-gpu-vendor={gpu_vendor}")
+
+        gpu_renderer = str(merged.get("gpu_renderer") or "").strip()
+        if gpu_renderer:
+            args.append(f"--fingerprint-gpu-renderer={gpu_renderer}")
+
+        hardware_concurrency = self._positive_int(merged.get("hardware_concurrency"))
+        if hardware_concurrency:
+            args.append(f"--fingerprint-hardware-concurrency={hardware_concurrency}")
+
+        extension_paths = self._split_setting_list(merged.get("extension_paths"))
+        if extension_paths:
+            extension_arg = ",".join(extension_paths)
+            args.extend(
+                [
+                    f"--disable-extensions-except={extension_arg}",
+                    f"--load-extension={extension_arg}",
+                ]
+            )
+        args.extend(self._split_setting_list(merged.get("launch_args")))
+
+        width = merged.get("screen_width") or merged.get("window_width")
+        height = merged.get("screen_height") or merged.get("window_height")
+        viewport: Optional[Dict[str, int]] = None
+        w_int = self._positive_int(width)
+        h_int = self._positive_int(height)
+        if w_int and h_int:
+            viewport = {"width": w_int, "height": h_int}
+            args.append(f"--window-size={w_int},{h_int}")
+            args.append(f"--fingerprint-screen-width={w_int}")
+            args.append(f"--fingerprint-screen-height={h_int}")
+
+        humanize_value = merged.get("humanize", True)
+        if isinstance(humanize_value, bool):
+            humanize_enabled = humanize_value
+        else:
+            humanize_enabled = str(humanize_value).strip().lower() not in {"0", "false", "no", "off"}
+        human_preset = str(merged.get("human_preset") or "default").strip().lower()
+        if human_preset not in {"default", "careful"}:
+            human_preset = "default"
+
+        kwargs: Dict[str, object] = {
+            "headless": self._browser_headless_value(merged.get("headless", False)),
+            "proxy": self._proxy_config,
+            "args": args,
+            "locale": locale_value,
+            "timezone": timezone_value,
+            "humanize": humanize_enabled,
+            "human_preset": human_preset,
+        }
+        kwargs["stealth_args"] = bool(merged.get("stealth_args", True))
+        backend = str(merged.get("backend") or "").strip()
+        if backend:
+            kwargs["backend"] = backend
+        user_agent = str(merged.get("user_agent") or "").strip()
+        if user_agent:
+            kwargs["user_agent"] = user_agent
+        color_scheme = str(merged.get("color_scheme") or "").strip().lower()
+        if color_scheme in {"light", "dark", "no-preference"}:
+            kwargs["color_scheme"] = color_scheme
+        kwargs["geoip"] = bool(merged.get("geoip", False))
+        if viewport:
+            kwargs["viewport"] = viewport
+        else:
+            kwargs["viewport"] = None
+        return kwargs
+
     def _normalize_navigator_overrides(self, raw: Optional[Dict[str, object]]) -> Dict[str, object]:
         if not isinstance(raw, dict):
             return {}
@@ -597,6 +761,14 @@ class BrowserInterface:
     async def _human_type(self, element, text: str, clear: bool = True) -> None:
         """Type text into an element character by character with small random delays."""
         if element is None:
+            return
+        humanize_raw = self._browser_settings.get("humanize", True)
+        humanize_enabled = humanize_raw if isinstance(humanize_raw, bool) else str(humanize_raw).lower() not in {"0", "false", "no", "off"}
+        if self.browser_engine == BROWSER_ENGINE_CLOAKBROWSER and humanize_enabled:
+            if clear:
+                await element.fill(text)
+            else:
+                await element.type(text)
             return
         if clear:
             try:
@@ -771,6 +943,23 @@ class BrowserInterface:
                 self._proxy_logger.error(msg)
                 raise RuntimeError("Proxy locale detection failed; see logs/proxy.log for details.")
 
+        if self.browser_engine == BROWSER_ENGINE_CLOAKBROWSER:
+            await self._start_cloakbrowser()
+        else:
+            await self._start_camoufox()
+        if getattr(self.context, "pages", None) and self.context.pages:
+            self.page = self.context.pages[0]
+        else:
+            self.page = await self.context.new_page()
+        self._attach_close_listeners()
+        if self._process_exit_callbacks:
+            self._start_process_watchdog()
+        self.logger.info("%s context started for %s", self.browser_engine, self.profile_name)
+        self.page.set_default_navigation_timeout(60000)
+        self.page.set_default_timeout(60000)
+        self._notify_browser_ready()
+
+    async def _start_camoufox(self) -> None:
         launch_kwargs = self._build_launch_kwargs()
         self.logger.info("Launching Camoufox for %s with kwargs keys: %s", self.profile_name, str(launch_kwargs))
         self._camoufox_ctx = AsyncCamoufox(**launch_kwargs)
@@ -783,17 +972,51 @@ class BrowserInterface:
         else:
             self.browser = camoufox_result
             self.context = await self.browser.new_context()
-        if use_persistent and self.context.pages:
-            self.page = self.context.pages[0]
-        else:
-            self.page = await self.context.new_page()
-        self._attach_close_listeners()
-        if self._process_exit_callbacks:
-            self._start_process_watchdog()
-        self.logger.info("Camoufox context started for %s", self.profile_name)
-        self.page.set_default_navigation_timeout(60000)
-        self.page.set_default_timeout(60000)
-        self._notify_browser_ready()
+
+    async def _start_cloakbrowser(self) -> None:
+        try:
+            from cloakbrowser import launch_async, launch_persistent_context_async
+        except Exception as exc:
+            raise RuntimeError("CloakBrowser is not installed. Run: pip install -r requirements.txt") from exc
+
+        merged = dict(self._cloakbrowser_defaults or {})
+        merged.update({k: v for k, v in (self._browser_settings or {}).items() if v is not None})
+        launch_kwargs = self._build_cloakbrowser_launch_kwargs()
+        use_persistent = bool(merged.get("persistent_context", True))
+        self.logger.info(
+            "Launching CloakBrowser for %s with kwargs keys: %s",
+            self.profile_name,
+            str(launch_kwargs),
+        )
+        try:
+            if use_persistent:
+                self.context = await launch_persistent_context_async(str(self.user_data_dir), **launch_kwargs)
+                self._cloakbrowser_context = self.context
+                self.browser = getattr(self.context, "browser", None)
+            else:
+                launch_only_kwargs = dict(launch_kwargs)
+                launch_only_kwargs.pop("viewport", None)
+                user_agent_value = launch_only_kwargs.pop("user_agent", None)
+                color_scheme_value = launch_only_kwargs.pop("color_scheme", None)
+                self.browser = await launch_async(**launch_only_kwargs)
+                context_kwargs: Dict[str, Any] = {}
+                viewport = launch_kwargs.get("viewport")
+                if isinstance(viewport, dict):
+                    context_kwargs["viewport"] = viewport
+                locale_value = launch_kwargs.get("locale")
+                timezone_value = launch_kwargs.get("timezone")
+                if locale_value:
+                    context_kwargs["locale"] = locale_value
+                if timezone_value:
+                    context_kwargs["timezone_id"] = timezone_value
+                if user_agent_value:
+                    context_kwargs["user_agent"] = user_agent_value
+                if color_scheme_value:
+                    context_kwargs["color_scheme"] = color_scheme_value
+                self.context = await self.browser.new_context(**context_kwargs)
+        except Exception as exc:
+            self.logger.exception("CloakBrowser start failed for %s", self.profile_name)
+            raise RuntimeError(f"CloakBrowser start failed: {exc}") from exc
 
     def _start_process_watchdog(self) -> None:
         """
@@ -852,11 +1075,11 @@ class BrowserInterface:
         threading.Thread(target=worker, daemon=True).start()
 
     async def close(self, force: bool = False):
-        if self.keep_browser_open and self.browser and not force:
-            self.logger.info("Keeping Camoufox session for %s open; force close when finished.", self.profile_name)
+        if self.keep_browser_open and (self.browser or self.context) and not force:
+            self.logger.info("Keeping %s session for %s open; force close when finished.", self.browser_engine, self.profile_name)
             return
 
-        self.logger.info("Closing Camoufox resources for %s", self.profile_name)
+        self.logger.info("Closing %s resources for %s", self.browser_engine, self.profile_name)
         try:
             if self.page:
                 await self.page.close()
@@ -866,6 +1089,11 @@ class BrowserInterface:
             if self._camoufox_ctx:
                 await self._camoufox_ctx.__aexit__(None, None, None)
                 self._camoufox_ctx = None
+            if self.browser_engine == BROWSER_ENGINE_CLOAKBROWSER and self.browser:
+                try:
+                    await self.browser.close()
+                except Exception:
+                    pass
             if self._local_proxy:
                 self._local_proxy.stop()
                 self._local_proxy = None

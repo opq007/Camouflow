@@ -8,7 +8,7 @@ import threading
 from PyQt6.QtCore import QEvent, Qt
 from PyQt6.QtGui import QPalette
 from PyQt6.QtWidgets import QApplication, QWidget
-from app.utils.gui_logging import GuiLogHandler, LOG_FORMAT, PROFILE_FILTER
+from app.utils.gui_logging import GuiLogHandler, LOG_FORMAT, PROFILE_FILTER, ProfileFormatter
 
 
 class LoggingMixin:
@@ -77,6 +77,8 @@ class LoggingMixin:
         edit.setTextCursor(cursor)
         edit.ensureCursorVisible()
         self._append_ui_log_to_file(text)
+        if hasattr(self, "_refresh_dashboard_activity"):
+            self._refresh_dashboard_activity()
 
     def _install_log_handler(self) -> None:
         if getattr(self, "_gui_log_handler", None):
@@ -86,14 +88,20 @@ class LoggingMixin:
             self._log_default_color = palette.color(QPalette.ColorRole.Text)
         handler = GuiLogHandler()
         handler.setLevel(logging.INFO)
-        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        handler.setFormatter(ProfileFormatter(LOG_FORMAT))
         handler.addFilter(PROFILE_FILTER)
         handler.connect(self._append_log_message)
         root_logger = logging.getLogger()
         if PROFILE_FILTER not in root_logger.filters:
             root_logger.addFilter(PROFILE_FILTER)
+        for existing_handler in root_logger.handlers:
+            existing_handler.setFormatter(ProfileFormatter(LOG_FORMAT))
+            if PROFILE_FILTER not in existing_handler.filters:
+                existing_handler.addFilter(PROFILE_FILTER)
         root_logger.addHandler(handler)
         root_logger.setLevel(logging.INFO)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
         self._gui_log_handler = handler
 
     def _refresh_log_colors(self) -> None:

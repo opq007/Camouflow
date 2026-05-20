@@ -17,11 +17,11 @@ class ScenarioEditor(QWidget):
         self.selected_idx: int = -1
         self.custom_positions: Dict[int, QPointF] = {}
         self.setMinimumHeight(200)
-        self.node_w = 210
-        self.node_h = 44
-        self.v_gap = 36
-        self.h_gap = 80
-        self.font = QFont("Consolas", 9)
+        self.node_w = 220
+        self.node_h = 76
+        self.v_gap = 52
+        self.h_gap = 110
+        self.font = QFont("Segoe UI", 9)
         self.offset = QPointF(0, 0)
         self.zoom = 1.0
         self._dragging = False
@@ -174,30 +174,15 @@ class ScenarioEditor(QWidget):
         return x, y, self.node_w, self.node_h
 
     def _draw_arrow(self, painter: QPainter, start: QPointF, end: QPointF, color: QColor) -> None:
-        painter.setPen(QPen(color, 2))
+        pen = QPen(color, 2)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setDashPattern([4, 5])
+        painter.setPen(pen)
         painter.drawLine(start, end)
-        # Arrow head
-        angle = 0.0
-        dx = end.x() - start.x()
-        dy = end.y() - start.y()
-        if dx or dy:
-            angle = math.atan2(dy, dx)
-        size = 8
-        left = QPointF(
-            end.x() - size * math.cos(angle - math.pi / 6),
-            end.y() - size * math.sin(angle - math.pi / 6),
-        )
-        right = QPointF(
-            end.x() - size * math.cos(angle + math.pi / 6),
-            end.y() - size * math.sin(angle + math.pi / 6),
-        )
-        painter.drawPolygon(end, left, right)
 
     def paintEvent(self, event) -> None:  # type: ignore[override]
         painter = QPainter(self)
-        bg_color = self.palette().window().color()
-        dark = bg_color.value() < 128
-        painter.fillRect(self.rect(), QColor("#121212") if dark else QColor("#f7f7f7"))
+        painter.fillRect(self.rect(), QColor("#1a1a2e"))
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.save()
         painter.scale(self.zoom, self.zoom)
@@ -208,12 +193,23 @@ class ScenarioEditor(QWidget):
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No steps")
             return
 
-        node_color = QColor("#2d89ef")
-        text_color = QColor("#ffffff")
-        ok_color = QColor("#2ecc71")
-        error_color = QColor("#e81123")
-        selected_pen = QPen(QColor("#ffda57"), 3)
-        input_color = QColor("#b0b0b0")
+        grid_pen = QPen(QColor(255, 255, 255, 18), 1)
+        painter.setPen(grid_pen)
+        grid = 24
+        for x in range(0, self.width() + grid, grid):
+            painter.drawLine(x, 0, x, self.height())
+        for y in range(0, self.height() + grid, grid):
+            painter.drawLine(0, y, self.width(), y)
+
+        node_color = QColor(22, 22, 42, 215)
+        start_color = QColor(6, 182, 212, 45)
+        text_color = QColor("#e8e8f0")
+        muted_color = QColor("#b0b0c8")
+        ok_color = QColor("#8b5cf6")
+        error_color = QColor("#ef4444")
+        selected_pen = QPen(QColor("#a78bfa"), 2)
+        border_pen = QPen(QColor(255, 255, 255, 28), 1)
+        input_color = QColor("#a78bfa")
 
         positions: Dict[int, Tuple[float, float, float, float]] = {}
 
@@ -224,8 +220,8 @@ class ScenarioEditor(QWidget):
         def connector_points(rect):
             x, y, w, h = rect
             input_pt = QPointF(x - 12, y + h * 0.5)
-            ok_pt = QPointF(x + w + 14, y + h * 0.32)
-            err_pt = QPointF(x + w + 14, y + h * 0.68)
+            ok_pt = QPointF(x + w + 14, y + h * 0.5)
+            err_pt = QPointF(x + w + 14, y + h * 0.5)
             return input_pt, ok_pt, err_pt
 
         # Draw arrows first for layering
@@ -260,8 +256,10 @@ class ScenarioEditor(QWidget):
         painter.setPen(Qt.PenStyle.NoPen)
         for idx, step in enumerate(self.steps):
             x, y, w, h = positions[idx]
-            painter.setBrush(node_color)
-            painter.drawRoundedRect(int(x), int(y), int(w), int(h), 6, 6)
+            is_start = str(step.get("action", "")).lower() == "start"
+            painter.setBrush(start_color if is_start else node_color)
+            painter.setPen(QPen(QColor("#06b6d4") if is_start else QColor(255, 255, 255, 32), 2 if is_start else 1))
+            painter.drawRoundedRect(int(x), int(y), int(w), int(h), 10, 10)
             painter.setPen(QPen(text_color, 1))
             tag = step.get("tag", "")
             action = step.get("action", "")
@@ -276,19 +274,27 @@ class ScenarioEditor(QWidget):
             try:
                 painter.setClipRect(int(x), int(y), int(w), int(h))
                 metrics = painter.fontMetrics()
-                available = max(0, int(w) - 16)
-                header = f"{tag} | {text}" if tag else text
-                header = metrics.elidedText(str(header), Qt.TextElideMode.ElideRight, available)
-                painter.drawText(int(x + 8), int(y + 16), header)
+                available = max(0, int(w) - 24)
+                step_text = f"Step {idx + 1}."
+                painter.setPen(QPen(QColor("#06b6d4") if is_start else QColor("#8b5cf6"), 1))
+                painter.setFont(QFont("Segoe UI", 8, QFont.Weight.DemiBold))
+                painter.drawText(int(x + 18), int(y + 22), step_text)
+                painter.setPen(QPen(text_color, 1))
+                painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+                header = metrics.elidedText(str(action_label), Qt.TextElideMode.ElideRight, available)
+                painter.drawText(int(x + 18), int(y + 46), header)
                 if selector:
+                    painter.setFont(QFont("Consolas", 8))
+                    painter.setPen(QPen(muted_color, 1))
                     line2 = metrics.elidedText(str(selector), Qt.TextElideMode.ElideRight, available)
-                    painter.drawText(int(x + 8), int(y + 32), line2)
+                    painter.drawText(int(x + 18), int(y + 64), line2)
             finally:
                 painter.restore()
+                painter.setFont(self.font)
             if idx == self.selected_idx:
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.setPen(selected_pen)
-                painter.drawRoundedRect(int(x - 2), int(y - 2), int(w + 4), int(h + 4), 8, 8)
+                painter.drawRoundedRect(int(x - 3), int(y - 3), int(w + 6), int(h + 6), 12, 12)
                 painter.setPen(QPen(text_color, 1))
             # connectors
             input_pt, ok_pt, err_pt = connector_points((x, y, w, h))
@@ -296,9 +302,7 @@ class ScenarioEditor(QWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.drawEllipse(input_pt, 4, 4)
             painter.setBrush(ok_color)
-            painter.drawEllipse(ok_pt, 5, 5)
-            painter.setBrush(error_color)
-            painter.drawEllipse(err_pt, 5, 5)
+            painter.drawEllipse(ok_pt, 6, 6)
         painter.restore()
 
     def _node_at(self, pos: QPointF) -> int:
@@ -313,8 +317,8 @@ class ScenarioEditor(QWidget):
         for idx, rect in self._last_positions.items():
             x, y, w, h = rect
             input_pt = QPointF(x - 10, y + h / 2)
-            ok_pt = QPointF(x + w + 10, y + h * 0.4)
-            err_pt = QPointF(x + w + 10, y + h * 0.6)
+            ok_pt = QPointF(x + w + 10, y + h * 0.5)
+            err_pt = QPointF(x + w + 10, y + h * 0.5)
             for kind, pt, radius in (("in", input_pt, 6.0), ("ok", ok_pt, 7.0), ("err", err_pt, 7.0)):
                 if (pos - pt).manhattanLength() <= radius + tolerance:
                     if idx == 0 and kind == "err":

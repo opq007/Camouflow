@@ -366,6 +366,8 @@ class ProxyPoolMixin:
     def _refresh_proxy_pool_views(self) -> None:
         self._refresh_proxy_pool_list()
         self._refresh_proxy_pool_detail()
+        if hasattr(self, "_refresh_dashboard"):
+            self._refresh_dashboard()
 
     def _refresh_proxy_pool_list(self) -> None:
         widget = getattr(self, "proxy_pool_list", None)

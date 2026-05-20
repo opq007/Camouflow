@@ -11,6 +11,15 @@ from PyQt6.QtCore import QObject, pyqtSignal
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s [%(profile)s]: %(message)s"
 
 
+class ProfileFormatter(logging.Formatter):
+    """Formatter that tolerates third-party records without profile context."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        if not hasattr(record, "profile") or record.profile in (None, ""):
+            record.profile = "-"
+        return super().format(record)
+
+
 class _GuiLogEmitter(QObject):
     message = pyqtSignal(str, int)
 
@@ -47,3 +56,6 @@ class ProfileContextFilter(logging.Filter):
 
 PROFILE_FILTER = ProfileContextFilter()
 
+def install_profile_log_record_factory() -> None:
+    """Backward-compatible no-op; ProfileFormatter handles missing profile."""
+    return

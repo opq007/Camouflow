@@ -209,7 +209,8 @@ class ScenarioRunnerMixin:
             profile_name=profile_name,
             proxy=proxy,
             keep_browser_open=True,
-            camoufox_settings=self._camoufox_settings_for_account(acc),
+            browser_engine=getattr(self, "browser_engine", "camoufox"),
+            browser_settings=self._browser_settings_for_account(acc),
         )
 
         browser.add_close_callback(
@@ -259,7 +260,19 @@ class ScenarioRunnerMixin:
                             browser._notify_browser_closed()
                             break
                         await page.evaluate("1")
-                    except Exception:
+                    except Exception as exc:
+                        message = str(exc).lower()
+                        transient = any(
+                            token in message
+                            for token in (
+                                "execution context was destroyed",
+                                "most likely because of a navigation",
+                                "frame was detached",
+                                "navigation",
+                            )
+                        )
+                        if transient:
+                            continue
                         LOGGER.exception("Browser keep-alive ping failed for %s", profile_name)
                         browser._notify_browser_closed()
                         break
@@ -413,9 +426,14 @@ class ScenarioRunnerMixin:
         self.log(f"[{scenario_name}] start for tag {stage_name} ({len(accounts)} accounts, limit {self.count_spin.value()})")
         self._run_scenario_async(accounts, scenario, f"tag {stage_name}")
 
-    def _camoufox_settings_for_account(self, acc: Dict) -> Dict[str, object]:
-        defaults = dict(getattr(self, "camoufox_defaults", {}) or {})
-        override = acc.get("camoufox_settings")
+    def _browser_settings_for_account(self, acc: Dict) -> Dict[str, object]:
+        engine = getattr(self, "browser_engine", "camoufox")
+        if engine == "cloakbrowser":
+            defaults = dict(getattr(self, "cloakbrowser_defaults", {}) or {})
+            override = acc.get("cloakbrowser_settings")
+        else:
+            defaults = dict(getattr(self, "camoufox_defaults", {}) or {})
+            override = acc.get("camoufox_settings")
         data: Dict[str, object] = {}
         if isinstance(override, dict):
             data = override
@@ -425,12 +443,22 @@ class ScenarioRunnerMixin:
                 if isinstance(parsed, dict):
                     data = parsed
             except Exception:
-                LOGGER.exception("Failed to parse camoufox_settings JSON")
+                LOGGER.exception("Failed to parse browser settings JSON")
                 data = {}
+        if engine == "cloakbrowser" and not data:
+            legacy = acc.get("camoufox_settings")
+            if isinstance(legacy, dict):
+                data = {k: v for k, v in legacy.items() if k in defaults}
         defaults.update(data or {})
+        defaults["browser_engine"] = engine
         return defaults
+
+    def _camoufox_settings_for_account(self, acc: Dict) -> Dict[str, object]:
+        return self._browser_settings_for_account(acc)
 
     def _prepare_account_payload(self, acc: Dict) -> Dict:
         payload = dict(acc)
-        payload["_camoufox_settings"] = self._camoufox_settings_for_account(acc)
+        payload["_browser_engine"] = getattr(self, "browser_engine", "camoufox")
+        payload["_browser_settings"] = self._browser_settings_for_account(acc)
+        payload["_camoufox_settings"] = payload["_browser_settings"]
         return payload

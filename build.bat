@@ -10,7 +10,11 @@ echo [2/2] Building with PyInstaller...
 if exist dist rmdir /s /q dist
 if exist build rmdir /s /q build
 
-py -m PyInstaller camouflow.spec --noconfirm --clean || exit /b 1
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" -m PyInstaller camouflow.spec --noconfirm --clean || exit /b 1
+) else (
+    py -3.12 -m PyInstaller camouflow.spec --noconfirm --clean || exit /b 1
+)
 
 echo.
 echo Build done: dist\CamouFlow\CamouFlow.exe

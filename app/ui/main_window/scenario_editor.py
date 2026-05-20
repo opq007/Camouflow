@@ -178,6 +178,8 @@ class ScenarioEditorMixin:
             self.current_steps = [{"action": "start", "tag": "Start"}]
             self.selected_scenario = None
             self.steps_list.clear()
+        if hasattr(self, "_refresh_dashboard"):
+            self._refresh_dashboard()
 
     def _on_scenario_selected(self) -> None:
         items = self.scenario_list_widget.selectedItems()
@@ -511,6 +513,9 @@ class ScenarioEditorMixin:
         if current >= 0:
             self.map_view.set_selected(current)
         self._refresh_vars_list()
+        total_label = getattr(self, "scenario_total_steps_label", None)
+        if total_label is not None:
+            total_label.setText(str(len(self.current_steps)))
 
     def _clear_step_form(self) -> None:
         self.step_selector_input.clear()

@@ -179,7 +179,7 @@ def load_or_create_profile_fingerprint(
     """
     Generate a Camoufox-style fingerprint and persist it per profile.
     """
-    fp, _ = load_or_create_profile_fingerprint_bundle(
+    fp, _, _ = load_or_create_profile_fingerprint_bundle(
         profile_dir,
         os_payload=os_payload,
         window=window,

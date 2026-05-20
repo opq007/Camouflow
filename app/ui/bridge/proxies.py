@@ -1,0 +1,355 @@
+"""Proxy pools bridge for QML."""
+
+from __future__ import annotations
+
+import json
+import threading
+from typing import Any, Dict, List
+
+from PyQt6.QtCore import QObject, pyqtProperty, pyqtSignal, pyqtSlot
+
+from app.storage.db import db_get_setting, db_set_setting
+from app.ui.bridge.models import DictListModel
+
+
+class ProxiesBridge(QObject):
+    modelChanged = pyqtSignal()
+    statsChanged = pyqtSignal()
+    message = pyqtSignal(str)
+
+    def __init__(self, app_state=None, parent=None) -> None:
+        super().__init__(parent)
+        self._app_state = app_state
+        self._model = DictListModel(["pool", "name", "location", "address", "type", "latency", "status", "accent", "index"], parent=self)
+        self._pools_model = DictListModel(["name", "total", "used", "selected"], parent=self)
+        self._selected_pool = ""
+        self._active = 0
+        self._checking = 0
+        self._failed = 0
+        self._locations = 0
+        if app_state is not None:
+            app_state.refreshRequested.connect(self.refresh)
+        self.refresh()
+
+    @pyqtProperty(QObject, constant=True)
+    def model(self) -> QObject:
+        return self._model
+
+    @pyqtProperty(QObject, constant=True)
+    def poolsModel(self) -> QObject:  # noqa: N802
+        return self._pools_model
+
+    @pyqtProperty(str, notify=modelChanged)
+    def selectedPool(self) -> str:  # noqa: N802
+        return self._selected_pool
+
+    @pyqtProperty(int, notify=statsChanged)
+    def active(self) -> int:
+        return self._active
+
+    @pyqtProperty(int, notify=statsChanged)
+    def checking(self) -> int:
+        return self._checking
+
+    @pyqtProperty(int, notify=statsChanged)
+    def failed(self) -> int:
+        return self._failed
+
+    @pyqtProperty(int, notify=statsChanged)
+    def locations(self) -> int:
+        return self._locations
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        try:
+            data = json.loads(db_get_setting("proxy_pools") or "{}")
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save(self, pools: Dict[str, Dict[str, Any]]) -> None:
+        db_set_setting("proxy_pools", json.dumps(pools, ensure_ascii=False))
+
+    def _emit_message(self, text: str) -> None:
+        self.message.emit(text)
+        if self._app_state is not None:
+            self._app_state.notify(text)
+
+    @pyqtSlot()
+    def refresh(self) -> None:
+        pools = self._load()
+        pool_rows: List[Dict[str, Any]] = []
+        total_all = 0
+        used_all = 0
+        for pool_name, pool in sorted(pools.items()):
+            proxies = pool.get("proxies", []) if isinstance(pool, dict) else []
+            total = len(proxies)
+            used = sum(1 for item in proxies if isinstance(item, dict) and item.get("assigned_to"))
+            total_all += total
+            used_all += used
+            pool_rows.append({"name": pool_name, "total": total, "used": used, "selected": self._selected_pool == pool_name})
+        self._pools_model.set_rows(
+            [{"name": "All pools", "total": total_all, "used": used_all, "selected": not self._selected_pool}]
+            + pool_rows
+        )
+        rows: List[Dict[str, Any]] = []
+        active = checking = failed = 0
+        locations = set()
+        idx = 1
+        for pool_name, pool in sorted(pools.items()):
+            if self._selected_pool and pool_name != self._selected_pool:
+                continue
+            for entry in pool.get("proxies", []) if isinstance(pool, dict) else []:
+                value = entry.get("value") if isinstance(entry, dict) else str(entry)
+                value = str(value or "").strip()
+                if not value:
+                    continue
+                check = entry.get("last_check") if isinstance(entry, dict) else {}
+                status_raw = str(check.get("status") or "active").lower() if isinstance(check, dict) else "active"
+                status = "Active" if status_raw in {"ok", "active"} else "Checking" if status_raw == "checking" else "Failed"
+                if status == "Active":
+                    active += 1
+                elif status == "Checking":
+                    checking += 1
+                else:
+                    failed += 1
+                country = str(check.get("country") or "") if isinstance(check, dict) else ""
+                city = str(check.get("city") or "") if isinstance(check, dict) else ""
+                location = ", ".join(p for p in [city, country] if p) or pool_name
+                locations.add(location)
+                type_label = "SOCKS5" if "socks" in value.lower() else "HTTP"
+                latency = check.get("ms") if isinstance(check, dict) else None
+                rows.append({
+                    "pool": pool_name,
+                    "name": str(entry.get("name") or f"{pool_name}-{idx:02d}") if isinstance(entry, dict) else f"{pool_name}-{idx:02d}",
+                    "location": location,
+                    "address": value,
+                    "type": type_label,
+                    "latency": f"{latency}ms" if isinstance(latency, int) else "?",
+                    "status": status,
+                    "accent": "#06b6d4" if status == "Active" else "#f59e0b" if status == "Checking" else "#ef4444",
+                    "index": idx - 1,
+                })
+                idx += 1
+        self._active, self._checking, self._failed, self._locations = active, checking, failed, len(locations)
+        self._model.set_rows(rows)
+        self.modelChanged.emit()
+        self.statsChanged.emit()
+
+    @pyqtSlot(str)
+    def selectPool(self, name: str) -> None:  # noqa: N802
+        name = str(name or "")
+        self._selected_pool = "" if name == "All pools" else name
+        self.refresh()
+
+
+    @pyqtSlot(str)
+    def createPool(self, name: str) -> None:  # noqa: N802
+        name = str(name or "").strip()
+        if not name:
+            self._emit_message("Pool name is empty")
+            return
+        pools = self._load()
+        if name in pools:
+            self._emit_message("Proxy pool already exists")
+            return
+        pools[name] = {"proxies": []}
+        self._selected_pool = name
+        self._save(pools)
+        self._emit_message(f"Proxy pool {name} created")
+        self.refresh()
+
+    @pyqtSlot(str)
+    def renameSelectedPool(self, name: str) -> None:  # noqa: N802
+        old_name = self._selected_pool
+        new_name = str(name or "").strip()
+        if not old_name:
+            self._emit_message("Select proxy pool first")
+            return
+        if not new_name or new_name == old_name:
+            return
+        pools = self._load()
+        if old_name not in pools:
+            self._emit_message("Selected proxy pool not found")
+            return
+        if new_name in pools:
+            self._emit_message("Proxy pool already exists")
+            return
+        pools[new_name] = pools.pop(old_name)
+        self._selected_pool = new_name
+        self._save(pools)
+        self._emit_message(f"Proxy pool renamed to {new_name}")
+        self.refresh()
+
+    @pyqtSlot()
+    def deleteSelectedPool(self) -> None:  # noqa: N802
+        name = self._selected_pool
+        if not name:
+            self._emit_message("Select proxy pool first")
+            return
+        pools = self._load()
+        if name not in pools:
+            return
+        pools.pop(name, None)
+        self._selected_pool = ""
+        self._save(pools)
+        self._emit_message(f"Proxy pool {name} deleted")
+        self.refresh()
+
+    @pyqtSlot(str)
+    def addProxies(self, values: str) -> None:  # noqa: N802
+        lines = [line.strip() for line in str(values or "").replace("\r", "\n").split("\n") if line.strip()]
+        if not lines:
+            self._emit_message("Proxy list is empty")
+            return
+        pools = self._load()
+        pool_name = self._selected_pool or "Default"
+        pool = pools.setdefault(pool_name, {"proxies": []})
+        proxies = pool.setdefault("proxies", [])
+        existing = {str(item.get("value") or "") for item in proxies if isinstance(item, dict)}
+        added = 0
+        for value in lines:
+            if value in existing:
+                continue
+            proxies.append({"value": value, "assigned_to": ""})
+            existing.add(value)
+            added += 1
+        self._selected_pool = pool_name
+        self._save(pools)
+        self._emit_message(f"Added {added} proxies to {pool_name}")
+        self.refresh()
+
+    @pyqtSlot(str)
+    def addProxy(self, value: str) -> None:  # noqa: N802
+        value = str(value or "").strip()
+        if not value:
+            self._emit_message("Proxy value is empty")
+            return
+        pools = self._load()
+        pool_name = self._selected_pool or "Default"
+        pool = pools.setdefault(pool_name, {"proxies": []})
+        proxies = pool.setdefault("proxies", [])
+        proxies.append({"value": value, "assigned_to": ""})
+        self._save(pools)
+        self._emit_message("Proxy added")
+        self.refresh()
+
+    @pyqtSlot(str, int, result="QVariant")
+    def getProxy(self, pool_name: str, index: int) -> Dict[str, Any]:  # noqa: N802
+        pool_name = str(pool_name or "").strip()
+        try:
+            index = int(index)
+        except Exception:
+            return {}
+        pool = self._load().get(pool_name)
+        if not isinstance(pool, dict):
+            return {}
+        proxies = pool.get("proxies", [])
+        if not (0 <= index < len(proxies)) or not isinstance(proxies[index], dict):
+            return {}
+        entry = proxies[index]
+        return {
+            "pool": pool_name,
+            "index": index,
+            "name": str(entry.get("name") or ""),
+            "value": str(entry.get("value") or ""),
+            "assigned_to": str(entry.get("assigned_to") or ""),
+        }
+
+    @pyqtSlot(str, int, str, str)
+    def saveProxy(self, pool_name: str, index: int, name: str, value: str) -> None:  # noqa: N802
+        pool_name = str(pool_name or "").strip()
+        value = str(value or "").strip()
+        if not value:
+            self._emit_message("Proxy value is empty")
+            return
+        try:
+            index = int(index)
+        except Exception:
+            self._emit_message("Proxy not found")
+            return
+        pools = self._load()
+        pool = pools.get(pool_name)
+        if not isinstance(pool, dict):
+            self._emit_message("Proxy pool not found")
+            return
+        proxies = pool.get("proxies", [])
+        if not (0 <= index < len(proxies)) or not isinstance(proxies[index], dict):
+            self._emit_message("Proxy not found")
+            return
+        proxies[index]["name"] = str(name or "").strip()
+        proxies[index]["value"] = value
+        self._save(pools)
+        self._emit_message("Proxy saved")
+        self.refresh()
+
+
+    @pyqtSlot(str, int)
+    def checkProxy(self, pool_name: str, index: int) -> None:  # noqa: N802
+        pool_name = str(pool_name or "").strip()
+        index = int(index)
+        pools = self._load()
+        pool = pools.get(pool_name)
+        if not isinstance(pool, dict):
+            self._emit_message("Proxy pool not found")
+            return
+        proxies = pool.get("proxies", [])
+        if not (0 <= index < len(proxies)) or not isinstance(proxies[index], dict):
+            self._emit_message("Proxy not found")
+            return
+        proxies[index]["last_check"] = {"status": "checking"}
+        self._save(pools)
+        self.refresh()
+
+        def worker() -> None:
+            try:
+                from app.ui.main_window.proxy_mixin import ProxyPoolMixin
+                data = self._load()
+                entry = data.get(pool_name, {}).get("proxies", [])[index]
+                ok, ms, err, meta = ProxyPoolMixin._probe_proxy_endpoint_value(str(entry.get("value") or ""), timeout_s=5.0)
+                result = dict(meta or {})
+                result["status"] = "ok" if ok else "fail"
+                result["ms"] = ms
+                if err:
+                    result["error"] = err
+                entry["last_check"] = result
+                self._save(data)
+                self._emit_message("Proxy check finished")
+            except Exception as exc:
+                self._emit_message(f"Proxy check failed: {exc}")
+            finally:
+                self.refresh()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @pyqtSlot()
+    def checkAll(self) -> None:  # noqa: N802
+        pools = self._load()
+        for pool in pools.values():
+            for entry in pool.get("proxies", []) if isinstance(pool, dict) else []:
+                if isinstance(entry, dict):
+                    entry["last_check"] = {"status": "checking"}
+        self._save(pools)
+        self.refresh()
+        self._emit_message("Proxy check started")
+
+        def worker() -> None:
+            try:
+                from app.ui.main_window.proxy_mixin import ProxyPoolMixin
+                data = self._load()
+                for pool in data.values():
+                    for entry in pool.get("proxies", []) if isinstance(pool, dict) else []:
+                        if not isinstance(entry, dict):
+                            continue
+                        ok, ms, err, meta = ProxyPoolMixin._probe_proxy_endpoint_value(str(entry.get("value") or ""), timeout_s=5.0)
+                        result = dict(meta or {})
+                        result["status"] = "ok" if ok else "fail"
+                        result["ms"] = ms
+                        if err:
+                            result["error"] = err
+                        entry["last_check"] = result
+                self._save(data)
+                self._emit_message("Proxy check finished")
+            finally:
+                self.refresh()
+
+        threading.Thread(target=worker, daemon=True).start()

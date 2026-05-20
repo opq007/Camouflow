@@ -5,16 +5,10 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from pathlib import Path
 
-from PyQt6.QtCore import QTimer
-from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication
-
-from app.utils.gui_logging import LOG_FORMAT, PROFILE_FILTER
-from app.storage.db import db_get_setting, init_db
-from app.ui.main_window import MainWindow
-from app.ui.style import DEFAULT_THEME, apply_modern_theme, normalize_theme
+from app.utils.gui_logging import LOG_FORMAT, PROFILE_FILTER, ProfileFormatter
+from app.storage.db import init_db
+from app.ui.qml_app import run_qml_app
 
 
 def main() -> None:
@@ -24,6 +18,7 @@ def main() -> None:
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    os.environ.setdefault("QT_LOGGING_RULES", "qt.text.font.db=false")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -32,6 +27,12 @@ def main() -> None:
     root_logger = logging.getLogger()
     if PROFILE_FILTER not in root_logger.filters:
         root_logger.addFilter(PROFILE_FILTER)
+    for handler in root_logger.handlers:
+        handler.setFormatter(ProfileFormatter(LOG_FORMAT))
+        if PROFILE_FILTER not in handler.filters:
+            handler.addFilter(PROFILE_FILTER)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     init_db()
 
@@ -44,27 +45,7 @@ def main() -> None:
         except Exception:
             pass
 
-    app = QApplication(sys.argv)
-
-    def _resource_path(relative: str) -> Path:
-        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-            return Path(getattr(sys, "_MEIPASS")).resolve() / relative
-        return Path(__file__).resolve().parents[1] / relative
-
-    icon_path = _resource_path("logo.ico")
-    if icon_path.exists():
-        icon = QIcon(str(icon_path))
-        app.setWindowIcon(icon)
-    else:
-        icon = QIcon()
-
-    stored_theme = normalize_theme(db_get_setting("ui_theme") or DEFAULT_THEME)
-    apply_modern_theme(app, stored_theme)
-    window = MainWindow()
-    if not icon.isNull():
-        window.setWindowIcon(icon)
-    QTimer.singleShot(0, window.showMaximized)
-    sys.exit(app.exec())
+    sys.exit(run_qml_app(sys.argv))
 
 
 if __name__ == "__main__":

@@ -5,11 +5,12 @@
     {
       "action": "start",
       "tag": "Start",
-      "next_success_step": "Step5",
       "_pos": {
-        "x": 80.0,
-        "y": 35.999999999999986
-      }
+        "x": 48.63,
+        "y": 250.76
+      },
+      "next_success_step": "Step5",
+      "next_error_step": "Step5"
     },
     {
       "action": "goto",
@@ -20,8 +21,8 @@
       "_ok_links": [],
       "_err_links": [],
       "_pos": {
-        "x": 537.8759111314829,
-        "y": 26.09998131591294
+        "x": 547.88,
+        "y": 251.1
       }
     }
   ]

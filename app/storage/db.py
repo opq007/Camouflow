@@ -98,6 +98,33 @@ CAMOUFOX_DEFAULTS: Dict[str, Any] = {
     "window_overrides": {},
 }
 
+CLOAKBROWSER_DEFAULTS: Dict[str, Any] = {
+    "headless": False,
+    "stealth_args": True,
+    "backend": "",
+    "humanize": True,
+    "human_preset": "default",
+    "locale": "",
+    "timezone": "",
+    "platform": "windows",
+    "user_agent": "",
+    "window_width": 0,
+    "window_height": 0,
+    "screen_width": 0,
+    "screen_height": 0,
+    "gpu_vendor": "",
+    "gpu_renderer": "",
+    "hardware_concurrency": 0,
+    "geoip": False,
+    "color_scheme": "",
+    "launch_args": [],
+    "persistent_context": True,
+    "extension_paths": [],
+}
+
+BROWSER_ENGINES = {"camoufox", "cloakbrowser"}
+DEFAULT_BROWSER_ENGINE = "camoufox"
+
 SAMPLE_SCENARIO = {
     "name": "Demo scenario",
     "description": "Sample scenario",
@@ -410,6 +437,40 @@ def db_set_camoufox_defaults(settings: Dict[str, Any]) -> None:
         if key in settings:
             merged[key] = settings[key]
     db_set_setting("camoufox_defaults", json.dumps(merged, ensure_ascii=False))
+
+
+def db_get_browser_engine() -> str:
+    raw = (db_get_setting("browser_engine") or "").strip().lower()
+    return raw if raw in BROWSER_ENGINES else DEFAULT_BROWSER_ENGINE
+
+
+def db_set_browser_engine(engine: str) -> None:
+    normalized = str(engine or "").strip().lower()
+    if normalized not in BROWSER_ENGINES:
+        normalized = DEFAULT_BROWSER_ENGINE
+    db_set_setting("browser_engine", normalized)
+
+
+def db_get_cloakbrowser_defaults() -> Dict[str, Any]:
+    raw = db_get_setting("cloakbrowser_defaults")
+    if raw:
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                combined = dict(CLOAKBROWSER_DEFAULTS)
+                combined.update({k: data.get(k) for k in CLOAKBROWSER_DEFAULTS.keys() if k in data})
+                return combined
+        except Exception:
+            pass
+    return dict(CLOAKBROWSER_DEFAULTS)
+
+
+def db_set_cloakbrowser_defaults(settings: Dict[str, Any]) -> None:
+    merged = dict(CLOAKBROWSER_DEFAULTS)
+    for key in CLOAKBROWSER_DEFAULTS.keys():
+        if key in settings:
+            merged[key] = settings[key]
+    db_set_setting("cloakbrowser_defaults", json.dumps(merged, ensure_ascii=False))
 
 
 def db_get_selector_indices() -> Dict[str, int]:
