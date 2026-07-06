@@ -1,0 +1,10 @@
+{
+  "name": "New scenario",
+  "description": "",
+  "steps": [
+    {
+      "action": "start",
+      "tag": "Start"
+    }
+  ]
+}

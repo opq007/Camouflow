@@ -1,3 +1,1 @@
-from .scenario_engine import ScenarioExecutor, run_scenario
-
-__all__ = ["ScenarioExecutor", "run_scenario"]
+# Lazy imports ¡ª use explicit imports from scenario_engine when needed

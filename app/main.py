@@ -8,7 +8,7 @@ import sys
 
 from app.utils.gui_logging import LOG_FORMAT, PROFILE_FILTER, ProfileFormatter
 from app.storage.db import init_db
-from app.ui.qml_app import run_qml_app
+from app.ui.http_app import run_http_app
 
 
 def main() -> None:
@@ -18,7 +18,7 @@ def main() -> None:
         sys.stdout = open(os.devnull, "w", encoding="utf-8")
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w", encoding="utf-8")
-    os.environ.setdefault("QT_LOGGING_RULES", "qt.text.font.db=false")
+    os.environ.setdefault("QT_LOGGING_RULES", "")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -45,7 +45,7 @@ def main() -> None:
         except Exception:
             pass
 
-    sys.exit(run_qml_app(sys.argv))
+    sys.exit(run_http_app(sys.argv))
 
 
 if __name__ == "__main__":

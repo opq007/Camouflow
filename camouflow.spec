@@ -11,14 +11,18 @@ ROOT = Path(SPECPATH).resolve()
 datas = [
     (str(ROOT / "logo.ico"), "."),
     (str(ROOT / "scenaries"), "scenaries"),
-    (str(ROOT / "app" / "qml"), "app/qml"),
+    (str(ROOT / "app" / "static"), "app/static"),
 ]
 
 datas += collect_data_files("browserforge")
 hiddenimports = collect_submodules("browserforge")
 hiddenimports += [
-    "PyQt6.QtQml",
-    "PyQt6.QtQuick",
+    "fastapi",
+    "uvicorn",
+    "uvicorn.loops",
+    "uvicorn.protocols",
+    "websockets",
+    "starlette",
 ]
 
 # camoufox ships non-.py assets (e.g. YAML manifests) that must be bundled.

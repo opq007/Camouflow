@@ -35,6 +35,32 @@ def _import_camoufox():
 
     return imported
 
+# Monkey-patch: strip isMobile from Camoufox's launch_options result.
+# Camoufox Firefox juggler rejects the isMobile field in setDefaultViewport.
+_camoufox_launch_patched = False
+
+
+def _apply_camoufox_launch_patch():
+    global _camoufox_launch_patched
+    if _camoufox_launch_patched:
+        return
+    _camoufox_launch_patched = True
+    try:
+        import camoufox.utils
+        _orig = camoufox.utils.launch_options
+
+        def _patched(*args, **kwargs):
+            result = _orig(*args, **kwargs)
+            if isinstance(result, dict) and 'viewport' in result:
+                vp = result['viewport']
+                if isinstance(vp, dict):
+                    vp.pop('isMobile', None)
+            return result
+
+        camoufox.utils.launch_options = _patched
+    except Exception:
+        pass
+
 
 def _sample_webgl(*args, **kwargs):
     from camoufox.webgl.sample import sample_webgl
@@ -984,6 +1010,7 @@ class BrowserInterface:
         self._notify_browser_ready()
 
     async def _start_camoufox(self) -> None:
+        _apply_camoufox_launch_patch()
         launch_kwargs = self._build_launch_kwargs()
         self.logger.info("Launching Camoufox for %s with kwargs keys: %s", self.profile_name, str(launch_kwargs))
         Camoufox = _import_camoufox()

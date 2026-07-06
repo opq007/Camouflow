@@ -258,6 +258,8 @@ def _load_accounts_raw() -> List[Dict]:
     try:
         data = json.loads(ACCOUNTS_FILE.read_text(encoding="utf-8"))
         return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return []
     except Exception:
         LOGGER.exception("Failed to load accounts.json")
         return []
@@ -372,6 +374,8 @@ def _load_settings() -> Dict[str, str]:
     try:
         data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
         return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
     except Exception:
         LOGGER.exception("Failed to load settings.json")
         return {}
