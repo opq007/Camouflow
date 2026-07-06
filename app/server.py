@@ -234,6 +234,7 @@ def api_profile_get(name: str, engine: str = "camoufox") -> JSONResponse:
     return JSONResponse({
         "name": str(acc.get("name") or ""),
         "stage": str(acc.get("stage") or ""),
+        "proxy_scheme": str(acc.get("proxy_scheme") or "socks5"),
         "proxy_host": str(acc.get("proxy_host") or ""),
         "proxy_port": "" if acc.get("proxy_port") in (None, "") else str(acc.get("proxy_port")),
         "proxy_user": str(acc.get("proxy_user") or ""),
@@ -282,6 +283,7 @@ def api_profile_save(name: str, data: Dict[str, Any]) -> JSONResponse:
         "name": clean_name,
         "stage": str(data.get("stage") or "").strip(),
         "_browser_engine": str(data.get("engine") or "camoufox").lower(),
+        "proxy_scheme": str(data.get("proxy_scheme") or "socks5").strip(),
         "proxy_host": str(data.get("proxy_host") or "").strip(),
         "proxy_user": str(data.get("proxy_user") or "").strip(),
         "proxy_password": str(data.get("proxy_password") or "").strip(),
@@ -337,14 +339,30 @@ def api_profile_start(name: str) -> JSONResponse:
     engine = str(acc.get("_browser_engine") or acc.get("browser_engine") or "camoufox")
     from app.core.browser_interface import BrowserInterface
 
-    settings = _settings_dict(acc.get("cloakbrowser_settings") if engine == "cloakbrowser" else acc.get("camoufox_settings"))
+    # Merge global browser defaults with profile-specific settings
+    if engine == "cloakbrowser":
+        global_defaults = dict(db_get_cloakbrowser_defaults() or CLOAKBROWSER_DEFAULTS)
+    else:
+        global_defaults = dict(db_get_camoufox_defaults() or CAMOUFOX_DEFAULTS)
+    profile_settings = _settings_dict(acc.get("cloakbrowser_settings") if engine == "cloakbrowser" else acc.get("camoufox_settings"))
+    settings = {**global_defaults, **(profile_settings or {})}
     if settings is None:
         settings = {}
     settings.setdefault("headless", False)
+    # Cap window dimensions so browsers stay manageable
+    w = settings.get("window_width", 0)
+    h = settings.get("window_height", 0)
+    if isinstance(w, (int, float)) and w > 1920:
+        settings["window_width"] = 1920
+    if isinstance(h, (int, float)) and h > 1080:
+        settings["window_height"] = 1080
 
-    # Allocate a CDP debugging port
+    # Allocate a CDP debugging port (skip ports already tracked in _live_browsers)
+    used_ports = {info.get("cdp_port") for info in _live_browsers.values()}
     cdp_port = 0
     for port in range(9222, 9262):
+        if port in used_ports:
+            continue
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(("127.0.0.1", port))

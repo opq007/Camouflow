@@ -87,9 +87,9 @@ async function loadDashboard() {
   const metrics = d.metrics || {};
   const grid = document.getElementById('stat-grid');
   const items = [
-    ['Profiles', metrics.profile_total || 0, 'profiles'],
-    ['Running', metrics.profile_running || 0, 'profiles'],
-    ['Scenarios', metrics.scenario_total || 0, 'scenarios'],
+    ['Profiles', metrics.profiles || 0, 'profiles'],
+    ['Running', metrics.running || 0, 'profiles'],
+    ['Scenarios', metrics.scenarios || 0, 'scenarios'],
     ['Proxies', metrics.proxy_total || 0, 'proxies'],
   ];
   grid.innerHTML = items.map(i => `<div class="stat-card"><div class="stat-value">${i[1]}</div><div class="stat-label">${i[0]}</div></div>`).join('');
@@ -147,10 +147,12 @@ async function profilesEdit(name) {
     <div class="form-row"><div class="form-group"><label>Name</label><input id="pe-name" value="${escHtml(p.name)}"></div>
     <div class="form-group"><label>Stage</label><input id="pe-stage" value="${escHtml(p.stage)}"></div></div>
     <div class="form-row"><div class="form-group"><label>Engine</label><select id="pe-engine"><option value="camoufox" ${p.engine==='camoufox'?'selected':''}>Camoufox</option><option value="cloakbrowser" ${p.engine==='cloakbrowser'?'selected':''}>CloakBrowser</option></select></div></div>
-    <div class="form-row"><div class="form-group"><label>Proxy Host</label><input id="pe-phost" value="${escHtml(p.proxy_host)}"></div>
-    <div class="form-group"><label>Proxy Port</label><input id="pe-pport" value="${escHtml(p.proxy_port)}"></div></div>
-    <div class="form-row"><div class="form-group"><label>Proxy User</label><input id="pe-puser" value="${escHtml(p.proxy_user)}"></div>
-    <div class="form-group"><label>Proxy Password</label><input id="pe-ppass" type="password" value="${escHtml(p.proxy_password)}"></div></div>
+    <div class="card-title">Proxy</div>
+    <div class="form-row"><div class="form-group"><label>Scheme</label><select id="pe-pscheme"><option value="socks5" ${(p.proxy_scheme||'socks5')!=='http'?'selected':''}>SOCKS5</option><option value="http" ${(p.proxy_scheme||'socks5')==='http'?'selected':''}>HTTP</option></select></div>
+    <div class="form-group"><label>Host</label><input id="pe-phost" value="${escHtml(p.proxy_host||'')}"></div></div>
+    <div class="form-row"><div class="form-group"><label>Port</label><input id="pe-pport" value="${escHtml(p.proxy_port||'')}" type="number"></div>
+    <div class="form-group"><label>Username</label><input id="pe-puser" value="${escHtml(p.proxy_user||'')}"></div></div>
+    <div class="form-group"><label>Password</label><input id="pe-ppass" type="password" value="${escHtml(p.proxy_password||'')}"></div>
     <div class="card-title">Browser Overrides</div>
     <div class="form-row"><div class="form-group"><label>Locale</label><input id="pe-locale" value="${escHtml(p.locale)}" placeholder="Auto-detect"></div>
     <div class="form-group"><label>Timezone</label><input id="pe-tz" value="${escHtml(p.timezone)}" placeholder="Auto-detect"></div></div>
@@ -158,7 +160,7 @@ async function profilesEdit(name) {
     <div class="form-group"><label>WebGL Vendor</label><input id="pe-wgv" value="${escHtml(p.webgl_vendor)}" placeholder="Auto"></div></div>
     <div class="form-group"><label>CPU Cores</label><input id="pe-cpu" value="${p.hardware_concurrency||''}" placeholder="Auto" type="number"></div>
   `, async () => {
-    const data = { name: g('pe-name'), stage: g('pe-stage'), engine: g('pe-engine'), proxy_host: g('pe-phost'), proxy_port: g('pe-pport'), proxy_user: g('pe-puser'), proxy_password: g('pe-ppass'), locale: g('pe-locale'), timezone: g('pe-tz'), user_agent: g('pe-ua'), webgl_vendor: g('pe-wgv'), hardware_concurrency: g('pe-cpu') };
+    const data = { name: g('pe-name'), stage: g('pe-stage'), engine: g('pe-engine'), proxy_scheme: g('pe-pscheme'), proxy_host: g('pe-phost'), proxy_port: g('pe-pport'), proxy_user: g('pe-puser'), proxy_password: g('pe-ppass'), locale: g('pe-locale'), timezone: g('pe-tz'), user_agent: g('pe-ua'), webgl_vendor: g('pe-wgv'), hardware_concurrency: g('pe-cpu') };
     await apiPut('/profiles/' + encodeURIComponent(name), data);
     toast('Profile saved'); loadProfiles();
   });
@@ -481,9 +483,13 @@ function truncate(s, n) { return s && s.length > n ? s.slice(0, n-2) + '..' : s|
 
 // ===== LOGS =====
 async function loadLogs() {
-  const data = await apiGet('/logs');
   const output = document.getElementById('logs-output');
-  output.textContent = (data||[]).join('\n') || 'No logs yet';
+  try {
+    const data = await apiGet('/logs');
+    output.textContent = Array.isArray(data) ? data.join('\n') || 'No logs yet' : 'No logs yet';
+  } catch(e) {
+    output.textContent = 'Failed to load logs: ' + e.message;
+  }
   output.scrollTop = output.scrollHeight;
 }
 async function logsRefresh() { loadLogs(); }

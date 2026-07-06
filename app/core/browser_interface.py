@@ -1141,7 +1141,7 @@ class BrowserInterface:
             if self._camoufox_ctx:
                 await self._camoufox_ctx.__aexit__(None, None, None)
                 self._camoufox_ctx = None
-            if self.browser_engine == BROWSER_ENGINE_CLOAKBROWSER and self.browser:
+            if self.browser:
                 try:
                     await self.browser.close()
                 except Exception:
