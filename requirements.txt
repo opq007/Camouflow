@@ -6,3 +6,4 @@ fastapi
 uvicorn[standard]
 websockets
 playwright==1.54.0
+websockify

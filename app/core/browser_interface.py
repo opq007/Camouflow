@@ -164,8 +164,10 @@ class BrowserInterface:
         camoufox_settings: Optional[Dict[str, object]] = None,
         browser_engine: Optional[str] = None,
         browser_settings: Optional[Dict[str, object]] = None,
+        display: str = "",
     ) -> None:
         self.profile_name = profile_name
+        self._display = str(display or "")
         self.proxy = proxy
         self.keep_browser_open = keep_browser_open
         self.profile_root = profile_dir_for_email(self.profile_name)
@@ -993,6 +995,8 @@ class BrowserInterface:
                 self._proxy_logger.error(msg)
                 raise RuntimeError("Proxy locale detection failed; see logs/proxy.log for details.")
 
+        if self._display:
+            os.environ["DISPLAY"] = self._display
         if self.browser_engine == BROWSER_ENGINE_CLOAKBROWSER:
             await self._start_cloakbrowser()
         else:

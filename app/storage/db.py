@@ -84,8 +84,8 @@ CAMOUFOX_DEFAULTS: Dict[str, Any] = {
     "timezone": "",
     "os": [],
     "fonts": [],
-    "window_width": 0,
-    "window_height": 0,
+    "window_width": 1280,
+    "window_height": 720,
     "persistent_context": True,
     "enable_cache": True,
     "block_webrtc": False,
@@ -96,6 +96,10 @@ CAMOUFOX_DEFAULTS: Dict[str, Any] = {
     "exclude_addons": [],
     "navigator_overrides": {},
     "window_overrides": {},
+    "vd_enabled": False,
+    "vd_width": 1440,
+    "vd_height": 900,
+    "vd_depth": 24,
 }
 
 CLOAKBROWSER_DEFAULTS: Dict[str, Any] = {
@@ -108,10 +112,10 @@ CLOAKBROWSER_DEFAULTS: Dict[str, Any] = {
     "timezone": "",
     "platform": "windows",
     "user_agent": "",
-    "window_width": 0,
-    "window_height": 0,
-    "screen_width": 0,
-    "screen_height": 0,
+    "window_width": 1280,
+    "window_height": 720,
+    "screen_width": 1280,
+    "screen_height": 720,
     "gpu_vendor": "",
     "gpu_renderer": "",
     "hardware_concurrency": 0,
@@ -120,6 +124,10 @@ CLOAKBROWSER_DEFAULTS: Dict[str, Any] = {
     "launch_args": [],
     "persistent_context": True,
     "extension_paths": [],
+    "vd_enabled": False,
+    "vd_width": 1440,
+    "vd_height": 900,
+    "vd_depth": 24,
 }
 
 BROWSER_ENGINES = {"camoufox", "cloakbrowser"}

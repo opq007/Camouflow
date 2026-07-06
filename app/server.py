@@ -14,7 +14,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-
+from app.core.virtual_display import get_virtual_display_manager
 from app.storage.db import (
     CAMOUFOX_DEFAULTS,
     CLOAKBROWSER_DEFAULTS,
@@ -50,7 +50,6 @@ _log_messages: List[str] = []
 _log_queue: List[str] = []
 _loop: asyncio.AbstractEventLoop | None = None
 
-
 def _install_loop() -> None:
     """Capture the running event loop for thread-safe log broadcasting."""
     global _loop
@@ -58,7 +57,6 @@ def _install_loop() -> None:
         _loop = asyncio.get_running_loop()
     except RuntimeError:
         pass
-
 
 async def _flush_log_queue() -> None:
     """Coroutine that runs on the event loop to send queued messages."""
@@ -80,7 +78,6 @@ async def _flush_log_queue() -> None:
             if ws in _log_clients:
                 _log_clients.remove(ws)
 
-
 def broadcast_log(message: str) -> None:
     _log_messages.append(message)
     if len(_log_messages) > 1000:
@@ -92,17 +89,97 @@ def broadcast_log(message: str) -> None:
 # --- Live browser tracking ---
 _live_browsers: Dict[str, Any] = {}  # name -> {browser, cdp_port, engine}
 
+# --- proxy pool assignment ---
+_assigned_proxies: Dict[str, str] = {}  # profile_name -> proxy_value
+
+def _assigned_pool_proxy(pool_name: str, profile_name: str) -> str:
+    global _assigned_proxies
+    if profile_name in _assigned_proxies:
+        return _assigned_proxies[profile_name]
+    # Look up from pool data
+    try:
+        pools = json.loads(db_get_setting("proxy_pools") or "{}")
+        pool = pools.get(pool_name)
+        if isinstance(pool, dict):
+            for px in (pool.get("proxies") or []):
+                if isinstance(px, dict) and profile_name in [a.strip() for a in str(px.get("assigned_to") or "").split(",") if a.strip()]:
+                    val = str(px.get("value") or "")
+                    if val:
+                        _assigned_proxies[profile_name] = val
+                        return val
+    except Exception:
+        pass
+    return ""
+
+def _assign_pool_proxy(pool_name: str, profile_name: str) -> Optional[str]:
+    global _assigned_proxies
+    try:
+        pools = json.loads(db_get_setting("proxy_pools") or "{}")
+        pool = pools.get(pool_name)
+        if not isinstance(pool, dict):
+            return None
+        proxies = pool.get("proxies") or []
+        for px in proxies:
+            if isinstance(px, dict):
+                val = str(px.get("value") or "")
+                if val:
+                    # Track assignment (comma-separated for multi-profile support)
+                    existing = str(px.get("assigned_to") or "").strip()
+                    assigned_list = [a.strip() for a in existing.split(",") if a.strip()] if existing else []
+                    if profile_name not in assigned_list:
+                        assigned_list.append(profile_name)
+                        px["assigned_to"] = ", ".join(assigned_list)
+                    else:
+                        px["assigned_to"] = existing
+                    px["status"] = "in use"
+                    _assigned_proxies[profile_name] = val
+                    pool["proxies"] = proxies
+                    db_set_setting("proxy_pools", json.dumps(pools, ensure_ascii=False))
+                    return val
+    except Exception:
+        pass
+    return None
+
+def _release_pool_proxy(pool_name: str, profile_name: str) -> None:
+    global _assigned_proxies
+    _assigned_proxies.pop(profile_name, None)
+    try:
+        pools = json.loads(db_get_setting("proxy_pools") or "{}")
+        pool = pools.get(pool_name)
+        if isinstance(pool, dict):
+            for px in (pool.get("proxies") or []):
+                if isinstance(px, dict):
+                    existing = str(px.get("assigned_to") or "").strip()
+                    assigned_list = [a.strip() for a in existing.split(",") if a.strip()] if existing else []
+                    if profile_name in assigned_list:
+                        assigned_list.remove(profile_name)
+                        px["assigned_to"] = ", ".join(assigned_list)
+                        if not assigned_list:
+                            px["status"] = "idle"
+                    pool["proxies"] = pool.get("proxies") or []
+                    break
+            db_set_setting("proxy_pools", json.dumps(pools, ensure_ascii=False))
+    except Exception:
+        pass
+
 def _proxy_for(acc: Dict[str, Any]) -> str:
+    # Priority: direct host/port, then proxy pool assignment
     scheme = str(acc.get("proxy_scheme") or "socks5").strip() or "socks5"
     host = str(acc.get("proxy_host") or "")
     port = acc.get("proxy_port")
     user = str(acc.get("proxy_user") or "")
     pwd = str(acc.get("proxy_password") or "")
-    if not (host and port):
-        return ""
-    if user and pwd:
-        return f"{scheme}://{user}:{pwd}@{host}:{port}"
-    return f"{scheme}://{host}:{port}"
+    if host and port:
+        if user and pwd:
+            return f"{scheme}://{user}:{pwd}@{host}:{port}"
+        return f"{scheme}://{host}:{port}"
+    # Try proxy pool
+    pool_name = str(acc.get("proxy_pool") or "")
+    if pool_name:
+        assigned = _assigned_pool_proxy(pool_name, str(acc.get("name") or ""))
+        if assigned:
+            return assigned
+    return 
 
 def _proxy_label(acc: Dict[str, Any]) -> str:
     host = str(acc.get("proxy_host") or "")
@@ -187,10 +264,11 @@ def api_profiles_list(stage: str = "") -> JSONResponse:
             "id": str(acc.get("id") or f"#{idx:04d}"),
             "browser": browser_label,
             "proxy": _proxy_label(acc),
+            "proxy_pool": str(acc.get("proxy_pool") or ""),
             "lastActive": str(acc.get("last_active") or ("now" if running else "idle")),
             "status": "Running" if running else "Stopped",
             "stage": stage_val or "No tag",
-            "running": running, "cdp_port": cdp_port, "cdp_url": f"http://127.0.0.1:{cdp_port}" if cdp_port else "",
+            "running": running, "cdp_port": cdp_port, "cdp_url": f"http://127.0.0.1:{cdp_port}" if cdp_port else "", "vnc_port": (_live_browsers.get(name) or {}).get("vnc_port", 0), "ws_port": (_live_browsers.get(name) or {}).get("ws_port", 0),
         })
     return JSONResponse(rows)
 
@@ -245,6 +323,7 @@ def api_profile_get(name: str, engine: str = "camoufox") -> JSONResponse:
         "webgl_vendor": str(settings.get("webgl_vendor") or settings.get("gpu_vendor") or ""),
         "hardware_concurrency": settings.get("hardware_concurrency"),
         "engine": str(acc.get("_browser_engine") or acc.get("browser_engine") or "camoufox"),
+        "proxy_pool": str(acc.get("proxy_pool") or ""),
     })
 
 @app.post("/api/profiles/import")
@@ -287,6 +366,7 @@ def api_profile_save(name: str, data: Dict[str, Any]) -> JSONResponse:
         "proxy_host": str(data.get("proxy_host") or "").strip(),
         "proxy_user": str(data.get("proxy_user") or "").strip(),
         "proxy_password": str(data.get("proxy_password") or "").strip(),
+        "proxy_pool": str(data.get("proxy_pool") or "").strip(),
     }
     port_text = str(data.get("proxy_port") or "").strip()
     if port_text:
@@ -331,11 +411,18 @@ def api_profile_start(name: str) -> JSONResponse:
     if name in _live_browsers:
         info = _live_browsers[name]
         cdp = info.get("cdp_port")
-        return JSONResponse({"ok": True, "status": "already_running", "cdp_port": cdp, "cdp_url": f"http://127.0.0.1:{cdp}" if cdp else ""})
+        return JSONResponse({"ok": True, "status": "already_running", "cdp_port": cdp, "cdp_url": f"http://127.0.0.1:{cdp}" if cdp else "", "vnc_port": info.get("vnc_port", 0), "display": info.get("display", "")})
     acc = next((item for item in db_get_accounts() if str(item.get("name") or "") == name), None)
     if not acc:
         return JSONResponse({"ok": False, "error": "Profile not found"}, 404)
     proxy = _proxy_for(acc)
+    # Auto-assign proxy from pool if profile has proxy_pool but no direct proxy
+    pool = str(acc.get("proxy_pool") or "")
+    if pool and not proxy:
+        assigned = _assign_pool_proxy(pool, name)
+        if assigned:
+            proxy = assigned
+            broadcast_log(f"Assigned proxy from pool {pool} to {name}")
     engine = str(acc.get("_browser_engine") or acc.get("browser_engine") or "camoufox")
     from app.core.browser_interface import BrowserInterface
 
@@ -352,10 +439,10 @@ def api_profile_start(name: str) -> JSONResponse:
     # Cap window dimensions so browsers stay manageable
     w = settings.get("window_width", 0)
     h = settings.get("window_height", 0)
-    if isinstance(w, (int, float)) and w > 1920:
-        settings["window_width"] = 1920
-    if isinstance(h, (int, float)) and h > 1080:
-        settings["window_height"] = 1080
+    if isinstance(w, (int, float)) and w > 1440:
+        settings["window_width"] = 1440
+    if isinstance(h, (int, float)) and h > 900:
+        settings["window_height"] = 900
 
     # Allocate a CDP debugging port (skip ports already tracked in _live_browsers)
     used_ports = {info.get("cdp_port") for info in _live_browsers.values()}
@@ -377,10 +464,42 @@ def api_profile_start(name: str) -> JSONResponse:
             launch_args.append(remote_flag)
         settings["launch_args"] = launch_args
 
+    # Virtual display: start Xvfb if configured
+    vdm = get_virtual_display_manager()
+    display_str = ""
+    vnc_info = None
+    if vdm.available and settings.get("vd_enabled"):
+        vd_w = int(settings.get("vd_width", 1920)) or 1920
+        vd_h = int(settings.get("vd_height", 1080)) or 1080
+        vd_d = int(settings.get("vd_depth", 24)) or 24
+        try:
+            display_str = vdm.start(name, width=vd_w, height=vd_h, depth=vd_d)
+            if display_str:
+                broadcast_log(f"Virtual display {display_str} started for {name}")
+                # Start x11vnc for remote VNC viewing
+                try:
+                    vnc_info = vdm.start_vnc(name)
+                    if vnc_info:
+                        vnc_port_str = str(vnc_info.get('vnc_port', 0))
+                        broadcast_log('VNC server for ' + name + ' on port ' + vnc_port_str)
+                        # Start websockify bridge for browser-based viewing
+                        try:
+                            ws_port = vdm.start_websockify(name)
+                            if ws_port:
+                                vnc_info['ws_port'] = ws_port
+                                broadcast_log('WebSocket for ' + name + ' on port ' + str(ws_port))
+                        except Exception as exc:
+                            broadcast_log('WebSocket start failed for ' + name + ': ' + str(exc))
+                except Exception as exc:
+                    broadcast_log('VNC start failed for ' + name + ': ' + str(exc))
+        except Exception as exc:
+            broadcast_log(f"Virtual display failed for {name}: {exc}")
+
     browser = BrowserInterface(profile_name=name, proxy=proxy, keep_browser_open=True,
-                               browser_engine=engine, browser_settings=settings)
+                               browser_engine=engine, browser_settings=settings,
+                               display=display_str or "")
     browser.add_close_callback(lambda: _on_browser_closed(name, browser))
-    _live_browsers[name] = {"browser": browser, "cdp_port": cdp_port, "engine": engine}
+    _live_browsers[name] = {"browser": browser, "cdp_port": cdp_port, "engine": engine, "display": display_str, "vnc_port": vnc_info.get("vnc_port", 0) if vnc_info else 0, "ws_port": vnc_info.get("ws_port", 0) if vnc_info else 0}
     broadcast_log(f"Starting browser for {name} (CDP port {cdp_port})")
 
     def worker() -> None:
@@ -398,7 +517,7 @@ def api_profile_start(name: str) -> JSONResponse:
                 pass
 
     threading.Thread(target=worker, daemon=True).start()
-    return JSONResponse({"ok": True, "status": "starting", "cdp_port": cdp_port, "cdp_url": f"http://127.0.0.1:{cdp_port}" if cdp_port else "", "headless": False})
+    return JSONResponse({"ok": True, "status": "starting", "cdp_port": cdp_port, "cdp_url": f"http://127.0.0.1:{cdp_port}" if cdp_port else "", "headless": False, "vnc_port": vnc_info.get("vnc_port") if vnc_info else 0, "display": display_str})
 @app.post("/api/profiles/{name}/stop")
 def api_profile_stop(name: str) -> JSONResponse:
     info = _live_browsers.pop(name, None)
@@ -453,11 +572,38 @@ def api_profile_variables_save(name: str, data: Dict[str, Any]) -> JSONResponse:
 def _on_browser_failed(name: str, browser: Any, exc: Exception) -> None:
     if (b := _live_browsers.get(name)) and b.get("browser") is browser:
         _live_browsers.pop(name, None)
+    try:
+        get_virtual_display_manager().stop(name)
+    except Exception:
+        pass
+    try:
+        accs = db_get_accounts()
+        acc = next((a for a in accs if str(a.get("name") or "") == name), None)
+        if acc:
+            pool = str(acc.get("proxy_pool") or "")
+            if pool:
+                _release_pool_proxy(pool, name)
+    except Exception:
+        pass
     broadcast_log(f"Cannot start {name}: {exc}")
 
 def _on_browser_closed(name: str, browser: Any) -> None:
     if (b := _live_browsers.get(name)) and b.get("browser") is browser:
         _live_browsers.pop(name, None)
+    try:
+        get_virtual_display_manager().stop(name)
+    except Exception:
+        pass
+    # Release pool proxy if assigned
+    try:
+        accs = db_get_accounts()
+        acc = next((a for a in accs if str(a.get("name") or "") == name), None)
+        if acc:
+            pool = str(acc.get("proxy_pool") or "")
+            if pool:
+                _release_pool_proxy(pool, name)
+    except Exception:
+        pass
     broadcast_log(f"Browser closed for {name}")
 
 # ============================================================
@@ -691,6 +837,36 @@ def api_proxy_delete(name: str, data: Dict[str, Any]) -> JSONResponse:
     for idx in sorted(indices, reverse=True):
         if 0 <= idx < len(proxies):
             proxies.pop(idx)
+    pools[name]["proxies"] = proxies
+    db_set_setting("proxy_pools", json.dumps(pools, ensure_ascii=False))
+    return JSONResponse({"ok": True})
+
+@app.post("/api/proxies/pool/{name}/assign")
+def api_proxy_assign(name: str, data: Dict[str, Any]) -> JSONResponse:
+    idx = int(data.get("index", -1) if data.get("index") is not None else -1)
+    profile = str(data.get("profile") or "").strip()
+    pools = _load_proxy_pools()
+    if name not in pools:
+        return JSONResponse({"ok": False, "error": "Pool not found"}, 404)
+    proxies = pools[name].get("proxies") or []
+    if idx < 0 or idx >= len(proxies):
+        return JSONResponse({"ok": False, "error": "Invalid proxy index"}, 400)
+    # Release previous assignment if any
+    old_assigned = str(proxies[idx].get("assigned_to") or "").strip()
+    # Assign or release
+    if profile:
+        # Check profile not already assigned to another proxy
+        for i, px in enumerate(proxies):
+            if i != idx and profile in [a.strip() for a in str(px.get("assigned_to") or "").split(",") if a.strip()]:
+                px["assigned_to"] = ""
+                px["status"] = "idle"
+        proxies[idx]["assigned_to"] = profile
+        proxies[idx]["status"] = "in use"
+        broadcast_log(f"Proxy {idx+1} in pool {name} assigned to {profile}")
+    else:
+        proxies[idx]["assigned_to"] = ""
+        proxies[idx]["status"] = "idle"
+        broadcast_log(f"Proxy {idx+1} in pool {name} released")
     pools[name]["proxies"] = proxies
     db_set_setting("proxy_pools", json.dumps(pools, ensure_ascii=False))
     return JSONResponse({"ok": True})

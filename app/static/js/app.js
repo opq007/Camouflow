@@ -119,7 +119,7 @@ function renderProfilesTable(rows) {
   const tbody = document.getElementById('profiles-table');
   tbody.innerHTML = rows.map(r => {
     const cdpInfo = r.running && r.cdp_url
-      ? `<a href="${r.cdp_url}" target="_blank" class="tag" style="background:rgba(6,182,212,0.18);color:#67e8f9;text-decoration:none;cursor:pointer" title="Open CDP DevTools">CDP :${r.cdp_port}</a>`
+      ? `<a href="${r.cdp_url}" target="_blank" class="tag" style="background:rgba(6,182,212,0.18);color:#67e8f9;text-decoration:none;cursor:pointer" title="Open CDP DevTools">CDP :${r.cdp_port}</a>` + (r.vnc_port ? ` <a href="/static/vnc_viewer.html?host=${location.hostname}&port=${r.ws_port}&profile=${encodeURIComponent(r.name)}" target="_blank" class="tag" style="background:rgba(168,85,247,0.18);color:#c084fc;text-decoration:none;cursor:pointer" title="Remote view via VNC">View</a>` : "")
       : '';
     return `<tr>
     <td><strong>${escHtml(r.name)}</strong>${cdpInfo}</td>
@@ -141,6 +141,10 @@ async function profilesStart(name) { const r = await apiPost('/profiles/' + enco
 async function profilesStop(name) { await apiPost('/profiles/' + encodeURIComponent(name) + '/stop'); toast('Stopping ' + name); setTimeout(loadProfiles, 500); }
 async function profilesDelete(name) { if (confirm('Delete profile ' + name + '?')) { await apiDelete('/profiles/' + encodeURIComponent(name)); toast('Deleted ' + name); loadProfiles(); } }
 async function profilesEdit(name) {
+  if (!stateCache.proxyPools) {
+    var pps = await apiGet('/proxies');
+    stateCache.proxyPools = (pps || []).map(function(p) { return p.name; });
+  }
   const p = await apiGet('/profiles/' + encodeURIComponent(name));
   if (!p.name) return;
   showModal('Edit Profile: ' + name, `
@@ -160,7 +164,7 @@ async function profilesEdit(name) {
     <div class="form-group"><label>WebGL Vendor</label><input id="pe-wgv" value="${escHtml(p.webgl_vendor)}" placeholder="Auto"></div></div>
     <div class="form-group"><label>CPU Cores</label><input id="pe-cpu" value="${p.hardware_concurrency||''}" placeholder="Auto" type="number"></div>
   `, async () => {
-    const data = { name: g('pe-name'), stage: g('pe-stage'), engine: g('pe-engine'), proxy_scheme: g('pe-pscheme'), proxy_host: g('pe-phost'), proxy_port: g('pe-pport'), proxy_user: g('pe-puser'), proxy_password: g('pe-ppass'), locale: g('pe-locale'), timezone: g('pe-tz'), user_agent: g('pe-ua'), webgl_vendor: g('pe-wgv'), hardware_concurrency: g('pe-cpu') };
+    const data = { name: g('pe-name'), stage: g('pe-stage'), engine: g('pe-engine'), proxy_scheme: g('pe-pscheme'), proxy_host: g('pe-phost'), proxy_port: g('pe-pport'), proxy_user: g('pe-puser'), proxy_password: g('pe-ppass'), proxy_pool: g('pe-ppool'), locale: g('pe-locale'), timezone: g('pe-tz'), user_agent: g('pe-ua'), webgl_vendor: g('pe-wgv'), hardware_concurrency: g('pe-cpu') };
     await apiPut('/profiles/' + encodeURIComponent(name), data);
     toast('Profile saved'); loadProfiles();
   });
@@ -173,6 +177,7 @@ function profilesImportShow() {
     <div class="form-group"><label>Proxy Pool</label><input id="pi-pool" placeholder="(none)"></div></div>
   `, async () => {
     const r = await apiPost('/profiles/import', { lines: g('pi-lines'), template: g('pi-template'), stage: g('pi-stage'), proxy_pool: g('pi-pool') });
+    stateCache.proxyPools = null;  // invalidate pool cache
     toast('Imported ' + (r.added || 0) + ' profiles'); loadProfiles();
   });
 }
@@ -217,12 +222,14 @@ async function loadBrowser() {
     <div class="form-row"><div class="form-group"><label>CPU Cores</label><input id="bs-hw" value="${s.hardware_concurrency||''}" placeholder="Auto" type="number"></div>
     <div class="form-group"><label>Color Scheme</label><select id="bs-cs"><option value="" ${!s.color_scheme?'selected':''}>System</option><option value="light">Light</option><option value="dark">Dark</option></select></div></div>
     `}
+    <div class="card-title" style="margin-top:12px">Virtual Display (Linux)</div><div class="form-row"><div class="form-group"><label>Enable Xvfb</label><select id="bs-vd"><option value="false">No</option><option value="true" ${s.vd_enabled===true?"selected":""}>Yes</option></select></div><div class="form-group"><label>Resolution</label><input id="bs-vdres" value="${s.vd_width||1920}x${s.vd_height||1080}" placeholder="1920x1080" style="width:100px"></div></div><div class="form-row"><div class="form-group"><label>Color Depth</label><select id="bs-vddepth"><option value="24" ${s.vd_depth!==16?"selected":""}>24-bit</option><option value="16" ${s.vd_depth===16?"selected":""}>16-bit</option></select></div></div>
     <div class="form-group"><label>Extension Paths (one per line)</label><textarea id="bs-ext">${(s.extension_paths||[]).join('\n')}</textarea></div>
     <div class="form-group"><label>Launch Args (one per line)</label><textarea id="bs-la">${(s.launch_args||[]).join('\n')}</textarea></div>
   `;
 }
 async function browserSave() {
-  const data = { browser_engine: g('bs-engine'), headless: g('bs-headless') === 'true' ? true : g('bs-headless') === 'virtual' ? 'virtual' : false, humanize: g('bs-humanize') === 'true', locale: g('bs-locale'), timezone: g('bs-tz'), persistent_context: g('bs-persist') === 'true', window_width: parseInt(g('bs-ww')) || 0, window_height: parseInt(g('bs-wh')) || 0, extension_paths: g('bs-ext').split('\n').filter(Boolean), launch_args: g('bs-la').split('\n').filter(Boolean) };
+  const vdRes = (g('bs-vdres') || '1920x1080').split('x');
+  const data = { browser_engine: g('bs-engine'), headless: g('bs-headless') === 'true' ? true : g('bs-headless') === 'virtual' ? 'virtual' : false, humanize: g('bs-humanize') === 'true', locale: g('bs-locale'), timezone: g('bs-tz'), persistent_context: g('bs-persist') === 'true', window_width: parseInt(g('bs-ww')) || 0, window_height: parseInt(g('bs-wh')) || 0, extension_paths: g('bs-ext').split('\n').filter(Boolean), launch_args: g('bs-la').split('\n').filter(Boolean), vd_enabled: g('bs-vd') === 'true', vd_width: parseInt(vdRes[0]) || 1920, vd_height: parseInt(vdRes[1]) || 1080, vd_depth: parseInt(g('bs-vddepth')) || 24 };
   const isCloak = g('bs-engine') === 'cloakbrowser';
   if (!isCloak) {
     data.block_webrtc = g('bs-webrtc') === 'true'; data.block_webgl = g('bs-webgl') === 'true';
@@ -247,7 +254,7 @@ async function loadProxies() {
         <button class="btn btn-sm btn-danger" onclick="proxiesPoolDelete('${escJs(p.name)}')">Delete Pool</button>
       </div>
       <div class="table-wrap"><table><thead><tr><th>Proxy</th><th>Assigned To</th><th>Actions</th></tr></thead><tbody>
-      ${(p.proxies||[]).map((px,i) => `<tr><td><code>${escHtml(px.value||'')}</code></td><td>${escHtml(px.assigned_to||'-')}</td><td><button class="btn btn-sm btn-danger" onclick="proxiesDelete('${escJs(p.name)}',${i})">Remove</button></td></tr>`).join('')}
+      ${(p.proxies||[]).map((px,i) => `<tr><td><code>${escHtml(px.value||'')}</code></td><td>${escHtml(px.assigned_to||'-')}</td><td><button class="btn btn-sm" style="background:rgba(168,85,247,0.15);color:#c084fc" onclick="proxiesAssignManually('${escJs(p.name)}',${i})">Assign</button> <button class="btn btn-sm btn-danger" onclick="proxiesDelete('${escJs(p.name)}',${i})">Remove</button></td></tr>`).join('')}
       </tbody></table></div></div>`).join('');
 }
 function proxiesPoolCreate() {
@@ -265,6 +272,25 @@ function proxiesImport(name) {
   `, async () => {
     const r = await apiPost('/proxies/pool/' + encodeURIComponent(name) + '/import', { lines: g('px-lines') });
     toast('Imported ' + (r.added||0) + ' proxies'); loadProxies();
+  });
+}
+async function proxiesAssignManually(poolName, idx) {
+  var pools = await apiGet('/proxies');
+  var pool = (pools || []).find(function(p) { return p.name === poolName; });
+  var px = pool && pool.proxies ? pool.proxies[idx] : null;
+  if (!px) return;
+  var profiles = await apiGet('/profiles');
+  var opts = '<option value="">(release)</option>';
+  for (var i = 0; i < profiles.length; i++) {
+    var pn = profiles[i].name;
+    var sel = (px.assigned_to || '') === pn ? 'selected' : '';
+    opts += '<option value="' + escHtml(pn) + '" ' + sel + '>' + escHtml(pn) + '</option>';
+  }
+  showModal('Assign Proxy', '<div class="form-group"><label>Proxy</label><code>' + escHtml(px.value || '') + '</code></div><div class="form-group"><label>Assign To</label><select id="ap-profile">' + opts + '</select></div>', async function() {
+    var prof = g('ap-profile');
+    await apiPost('/proxies/pool/' + encodeURIComponent(poolName) + '/assign', { index: idx, profile: prof });
+    toast(prof ? 'Proxy assigned to ' + prof : 'Proxy released');
+    loadProxies();
   });
 }
 async function proxiesDelete(poolName, index) {
