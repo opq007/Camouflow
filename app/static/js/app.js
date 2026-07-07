@@ -135,7 +135,7 @@ function renderProfilesTable(rows) {
 }
 async function profilesCreate() { const r = await apiPost('/profiles/create'); if (r.ok) { toast('Profile created'); loadProfiles(); } }
 function profilesRefresh() { loadProfiles(); }
-async function profilesStart(name) { const r = await apiPost('/profiles/' + encodeURIComponent(name) + '/start'); if (r.cdp_port > 0) { toast('Starting ' + name + ' 鈥?CDP port ' + r.cdp_port + (r.headless === false ? ' (visible)' : '')); } else { toast('Starting ' + name); } setTimeout(loadProfiles, 800); }
+async function profilesStart(name) { const r = await apiPost('/profiles/' + encodeURIComponent(name) + '/start'); if (r.cdp_port > 0) { toast('Starting ' + name + ' ?CDP port ' + r.cdp_port + (r.headless === false ? ' (visible)' : '')); } else { toast('Starting ' + name); } setTimeout(loadProfiles, 800); }
 async function profilesStop(name) { await apiPost('/profiles/' + encodeURIComponent(name) + '/stop'); toast('Stopping ' + name); setTimeout(loadProfiles, 500); }
 async function profilesDelete(name) { if (confirm('Delete profile ' + name + '?')) { await apiDelete('/profiles/' + encodeURIComponent(name)); toast('Deleted ' + name); loadProfiles(); } }
 async function profilesEdit(name) {
