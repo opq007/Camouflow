@@ -36,6 +36,7 @@ def _fingerprint_path(profile_dir: Path) -> Path:
 def _fingerprint_from_dict(payload: Dict) -> Fingerprint:
     FingerprintCls, NavigatorFingerprint, ScreenFingerprint = _import_fingerprint_types()
     screen_raw = payload.get("screen") or {}
+    screen_raw.pop("screenY", None)
     navigator_raw = payload.get("navigator") or {}
     screen = ScreenFingerprint(**screen_raw)
     navigator = NavigatorFingerprint(**navigator_raw)

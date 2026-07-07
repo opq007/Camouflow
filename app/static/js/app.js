@@ -143,15 +143,34 @@ async function profilesDelete(name) { if (confirm('Delete profile ' + name + '?'
 async function profilesEdit(name) {
   if (!stateCache.proxyPools) {
     var pps = await apiGet('/proxies');
-    stateCache.proxyPools = (pps || []).map(function(p) { return p.name; });
+    stateCache.proxyPools = pps || [];
   }
   const p = await apiGet('/profiles/' + encodeURIComponent(name));
   if (!p.name) return;
+  var proxyOpts = '<option value="">Direct / none</option>';
+  var assignedProxy = false;
+  stateCache.proxyPools.forEach(function(pool) {
+    (pool.proxies || []).forEach(function(px) {
+      var assigned = (px.assigned_to || '').split(',').map(function(s) { return s.trim(); });
+      if (pool.name === p.proxy_pool && assigned.indexOf(p.name) >= 0) assignedProxy = true;
+    });
+  });
+  stateCache.proxyPools.forEach(function(pool) {
+    proxyOpts += '<option value="pool:' + escHtml(pool.name) + '" ' + (pool.name === p.proxy_pool && !assignedProxy ? 'selected' : '') + '>Auto from pool: ' + escHtml(pool.name) + '</option>';
+    (pool.proxies || []).forEach(function(px, idx) {
+      var assigned = (px.assigned_to || '').split(',').map(function(s) { return s.trim(); });
+      var selected = pool.name === p.proxy_pool && assigned.indexOf(p.name) >= 0 ? 'selected' : '';
+      var label = px.name || ('Proxy #' + (idx + 1));
+      var meta = [px.value, px.country, px.region, px.tags].filter(Boolean).join(' / ');
+      proxyOpts += '<option value="proxy:' + escHtml(pool.name) + ':' + idx + '" ' + selected + '>' + escHtml(pool.name) + ' / ' + escHtml(label) + (meta ? ' (' + escHtml(meta) + ')' : '') + '</option>';
+    });
+  });
   showModal('Edit Profile: ' + name, `
     <div class="form-row"><div class="form-group"><label>Name</label><input id="pe-name" value="${escHtml(p.name)}"></div>
-    <div class="form-group"><label>Stage</label><input id="pe-stage" value="${escHtml(p.stage)}"></div></div>
+    <div class="form-group"><label>Stage (comma separated)</label><input id="pe-stage" value="${escHtml(p.stage)}" placeholder="Warmup, Ready"></div></div>
     <div class="form-row"><div class="form-group"><label>Engine</label><select id="pe-engine"><option value="camoufox" ${p.engine==='camoufox'?'selected':''}>Camoufox</option><option value="cloakbrowser" ${p.engine==='cloakbrowser'?'selected':''}>CloakBrowser</option></select></div></div>
     <div class="card-title">Proxy</div>
+    <div class="form-group"><label>Proxy</label><select id="pe-pproxy">${proxyOpts}</select></div>
     <div class="form-row"><div class="form-group"><label>Scheme</label><select id="pe-pscheme"><option value="socks5" ${(p.proxy_scheme||'socks5')!=='http'?'selected':''}>SOCKS5</option><option value="http" ${(p.proxy_scheme||'socks5')==='http'?'selected':''}>HTTP</option></select></div>
     <div class="form-group"><label>Host</label><input id="pe-phost" value="${escHtml(p.proxy_host||'')}"></div></div>
     <div class="form-row"><div class="form-group"><label>Port</label><input id="pe-pport" value="${escHtml(p.proxy_port||'')}" type="number"></div>
@@ -164,7 +183,8 @@ async function profilesEdit(name) {
     <div class="form-group"><label>WebGL Vendor</label><input id="pe-wgv" value="${escHtml(p.webgl_vendor)}" placeholder="Auto"></div></div>
     <div class="form-group"><label>CPU Cores</label><input id="pe-cpu" value="${p.hardware_concurrency||''}" placeholder="Auto" type="number"></div>
   `, async () => {
-    const data = { name: g('pe-name'), stage: g('pe-stage'), engine: g('pe-engine'), proxy_scheme: g('pe-pscheme'), proxy_host: g('pe-phost'), proxy_port: g('pe-pport'), proxy_user: g('pe-puser'), proxy_password: g('pe-ppass'), proxy_pool: g('pe-ppool'), locale: g('pe-locale'), timezone: g('pe-tz'), user_agent: g('pe-ua'), webgl_vendor: g('pe-wgv'), hardware_concurrency: g('pe-cpu') };
+    const pickedProxy = g('pe-pproxy').split(':');
+    const data = { name: g('pe-name'), stage: g('pe-stage'), engine: g('pe-engine'), proxy_scheme: g('pe-pscheme'), proxy_host: pickedProxy[0] ? '' : g('pe-phost'), proxy_port: pickedProxy[0] ? '' : g('pe-pport'), proxy_user: pickedProxy[0] ? '' : g('pe-puser'), proxy_password: pickedProxy[0] ? '' : g('pe-ppass'), proxy_pool: pickedProxy[0] ? pickedProxy[1] : '', proxy_index: pickedProxy[0] === 'proxy' ? pickedProxy[2] : '', locale: g('pe-locale'), timezone: g('pe-tz'), user_agent: g('pe-ua'), webgl_vendor: g('pe-wgv'), hardware_concurrency: g('pe-cpu') };
     await apiPut('/profiles/' + encodeURIComponent(name), data);
     toast('Profile saved'); loadProfiles();
   });
@@ -253,8 +273,8 @@ async function loadProxies() {
         <button class="btn btn-sm" onclick="proxiesImport('${escJs(p.name)}')">Import</button>
         <button class="btn btn-sm btn-danger" onclick="proxiesPoolDelete('${escJs(p.name)}')">Delete Pool</button>
       </div>
-      <div class="table-wrap"><table><thead><tr><th>Proxy</th><th>Assigned To</th><th>Actions</th></tr></thead><tbody>
-      ${(p.proxies||[]).map((px,i) => `<tr><td><code>${escHtml(px.value||'')}</code></td><td>${escHtml(px.assigned_to||'-')}</td><td><button class="btn btn-sm" style="background:rgba(168,85,247,0.15);color:#c084fc" onclick="proxiesAssignManually('${escJs(p.name)}',${i})">Assign</button> <button class="btn btn-sm btn-danger" onclick="proxiesDelete('${escJs(p.name)}',${i})">Remove</button></td></tr>`).join('')}
+      <div class="table-wrap"><table><thead><tr><th>Name</th><th>Proxy</th><th>Country</th><th>Region</th><th>Tags</th><th>Assigned To</th><th>Actions</th></tr></thead><tbody>
+      ${(p.proxies||[]).map((px,i) => `<tr><td>${escHtml(px.name||('Proxy #'+(i+1)))}</td><td><code>${escHtml(px.value||'')}</code></td><td>${escHtml(px.country||'-')}</td><td>${escHtml(px.region||'-')}</td><td>${escHtml(px.tags||'-')}</td><td>${escHtml(px.assigned_to||'-')}</td><td><button class="btn btn-sm" onclick="proxiesEdit('${escJs(p.name)}',${i})">Edit</button> <button class="btn btn-sm" style="background:rgba(168,85,247,0.15);color:#c084fc" onclick="proxiesAssignManually('${escJs(p.name)}',${i})">Assign</button> <button class="btn btn-sm btn-danger" onclick="proxiesDelete('${escJs(p.name)}',${i})">Remove</button></td></tr>`).join('')}
       </tbody></table></div></div>`).join('');
 }
 function proxiesPoolCreate() {
@@ -281,16 +301,27 @@ async function proxiesAssignManually(poolName, idx) {
   if (!px) return;
   var profiles = await apiGet('/profiles');
   var opts = '<option value="">(release)</option>';
+  var assigned = (px.assigned_to || '').split(',').map(function(s) { return s.trim(); });
   for (var i = 0; i < profiles.length; i++) {
     var pn = profiles[i].name;
-    var sel = (px.assigned_to || '') === pn ? 'selected' : '';
+    var sel = assigned.indexOf(pn) >= 0 ? 'selected' : '';
     opts += '<option value="' + escHtml(pn) + '" ' + sel + '>' + escHtml(pn) + '</option>';
   }
-  showModal('Assign Proxy', '<div class="form-group"><label>Proxy</label><code>' + escHtml(px.value || '') + '</code></div><div class="form-group"><label>Assign To</label><select id="ap-profile">' + opts + '</select></div>', async function() {
-    var prof = g('ap-profile');
-    await apiPost('/proxies/pool/' + encodeURIComponent(poolName) + '/assign', { index: idx, profile: prof });
-    toast(prof ? 'Proxy assigned to ' + prof : 'Proxy released');
+  showModal('Assign Proxy', '<div class="form-group"><label>Proxy</label><code>' + escHtml(px.value || '') + '</code></div><div class="form-group"><label>Assign To</label><select id="ap-profile" multiple size="8">' + opts + '</select></div>', async function() {
+    var profs = Array.from(document.getElementById('ap-profile').selectedOptions).map(function(o) { return o.value; }).filter(Boolean);
+    await apiPost('/proxies/pool/' + encodeURIComponent(poolName) + '/assign', { index: idx, profiles: profs.join(',') });
+    toast(profs.length ? 'Proxy assigned to ' + profs.length + ' profile(s)' : 'Proxy released');
     loadProxies();
+  });
+}
+async function proxiesEdit(poolName, idx) {
+  var pools = await apiGet('/proxies');
+  var pool = (pools || []).find(function(p) { return p.name === poolName; });
+  var px = pool && pool.proxies ? pool.proxies[idx] : null;
+  if (!px) return;
+  showModal('Edit Proxy', '<div class="form-group"><label>Name</label><input id="px-name" value="' + escHtml(px.name || ('Proxy #' + (idx + 1))) + '"></div><div class="form-group"><label>Proxy</label><input id="px-value" value="' + escHtml(px.value || '') + '"></div><div class="form-row"><div class="form-group"><label>Country</label><input id="px-country" value="' + escHtml(px.country || '') + '"></div><div class="form-group"><label>Region</label><input id="px-region" value="' + escHtml(px.region || '') + '"></div></div><div class="form-group"><label>Tags</label><input id="px-tags" value="' + escHtml(px.tags || '') + '" placeholder="residential, mobile"></div><div class="form-group"><label>Assigned profiles (comma separated)</label><input id="px-assigned" value="' + escHtml(px.assigned_to || '') + '"></div>', async function() {
+    await apiPut('/proxies/pool/' + encodeURIComponent(poolName) + '/proxies/' + idx, { name: g('px-name'), value: g('px-value'), country: g('px-country'), region: g('px-region'), tags: g('px-tags'), assigned_to: g('px-assigned') });
+    toast('Proxy updated'); loadProxies();
   });
 }
 async function proxiesDelete(poolName, index) {

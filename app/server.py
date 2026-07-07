@@ -92,6 +92,9 @@ _live_browsers: Dict[str, Any] = {}  # name -> {browser, cdp_port, engine}
 # --- proxy pool assignment ---
 _assigned_proxies: Dict[str, str] = {}  # profile_name -> proxy_value
 
+def _csv_list(value: Any) -> List[str]:
+    return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
 def _assigned_pool_proxy(pool_name: str, profile_name: str) -> str:
     global _assigned_proxies
     if profile_name in _assigned_proxies:
@@ -102,7 +105,7 @@ def _assigned_pool_proxy(pool_name: str, profile_name: str) -> str:
         pool = pools.get(pool_name)
         if isinstance(pool, dict):
             for px in (pool.get("proxies") or []):
-                if isinstance(px, dict) and profile_name in [a.strip() for a in str(px.get("assigned_to") or "").split(",") if a.strip()]:
+                if isinstance(px, dict) and profile_name in _csv_list(px.get("assigned_to")):
                     val = str(px.get("value") or "")
                     if val:
                         _assigned_proxies[profile_name] = val
@@ -124,13 +127,12 @@ def _assign_pool_proxy(pool_name: str, profile_name: str) -> Optional[str]:
                 val = str(px.get("value") or "")
                 if val:
                     # Track assignment (comma-separated for multi-profile support)
-                    existing = str(px.get("assigned_to") or "").strip()
-                    assigned_list = [a.strip() for a in existing.split(",") if a.strip()] if existing else []
+                    assigned_list = _csv_list(px.get("assigned_to"))
                     if profile_name not in assigned_list:
                         assigned_list.append(profile_name)
                         px["assigned_to"] = ", ".join(assigned_list)
                     else:
-                        px["assigned_to"] = existing
+                        px["assigned_to"] = ", ".join(assigned_list)
                     px["status"] = "in use"
                     _assigned_proxies[profile_name] = val
                     pool["proxies"] = proxies
@@ -149,15 +151,14 @@ def _release_pool_proxy(pool_name: str, profile_name: str) -> None:
         if isinstance(pool, dict):
             for px in (pool.get("proxies") or []):
                 if isinstance(px, dict):
-                    existing = str(px.get("assigned_to") or "").strip()
-                    assigned_list = [a.strip() for a in existing.split(",") if a.strip()] if existing else []
+                    assigned_list = _csv_list(px.get("assigned_to"))
                     if profile_name in assigned_list:
                         assigned_list.remove(profile_name)
                         px["assigned_to"] = ", ".join(assigned_list)
                         if not assigned_list:
                             px["status"] = "idle"
-                    pool["proxies"] = pool.get("proxies") or []
-                    break
+                        pool["proxies"] = pool.get("proxies") or []
+                        break
             db_set_setting("proxy_pools", json.dumps(pools, ensure_ascii=False))
     except Exception:
         pass
@@ -186,7 +187,41 @@ def _proxy_label(acc: Dict[str, Any]) -> str:
     port = acc.get("proxy_port")
     if host and port:
         return f"{host}:{port}"
-    return str(acc.get("proxy_pool") or "None")
+    pool_name = str(acc.get("proxy_pool") or "")
+    profile_name = str(acc.get("name") or "")
+    if pool_name and profile_name:
+        pool = _load_proxy_pools().get(pool_name)
+        if isinstance(pool, dict):
+            for idx, px in enumerate(pool.get("proxies") or [], start=1):
+                if isinstance(px, dict) and profile_name in _csv_list(px.get("assigned_to")):
+                    name = str(px.get("name") or f"Proxy #{idx}")
+                    return f"{pool_name} / {name}"
+    return pool_name or "None"
+
+def _sync_profile_proxy(pool_name: str, proxy: Dict[str, Any]) -> None:
+    value = str(proxy.get("value") or "")
+    assigned = _csv_list(proxy.get("assigned_to"))
+    if not value or not assigned:
+        return
+    for profile_name in assigned:
+        _assigned_proxies[profile_name] = value
+        db_update_account(profile_name, {"proxy_pool": pool_name})
+
+def _assign_specific_proxy(pool_name: str, proxy_index: int, profile_name: str) -> None:
+    pools = _load_proxy_pools()
+    proxies = (pools.get(pool_name) or {}).get("proxies") or []
+    if not profile_name or proxy_index < 0 or proxy_index >= len(proxies):
+        return
+    for idx, px in enumerate(proxies):
+        if not isinstance(px, dict):
+            continue
+        assigned = [name for name in _csv_list(px.get("assigned_to")) if name != profile_name]
+        if idx == proxy_index:
+            assigned.append(profile_name)
+        px["assigned_to"] = ", ".join(assigned)
+        px["status"] = "in use" if assigned else "idle"
+    db_set_setting("proxy_pools", json.dumps(pools, ensure_ascii=False))
+    _sync_profile_proxy(pool_name, proxies[proxy_index])
 
 def _settings_dict(value: Any) -> Optional[Dict[str, Any]]:
     if isinstance(value, dict):
@@ -246,7 +281,7 @@ def api_dashboard() -> JSONResponse:
 def api_profiles_list(stage: str = "") -> JSONResponse:
     accounts = db_get_accounts()
     if stage and stage != "All tags":
-        accounts = [a for a in accounts if str(a.get("stage") or "No tag") == stage]
+        accounts = [a for a in accounts if stage in (_csv_list(a.get("stage")) or ["No tag"])]
 
     rows = []
     for idx, acc in enumerate(accounts, start=1):
@@ -277,7 +312,8 @@ def api_profiles_stages() -> JSONResponse:
     accounts = db_get_accounts()
     stage_counts: Dict[str, int] = {}
     for acc in accounts:
-        stage_counts[str(acc.get("stage") or "No tag")] = stage_counts.get(str(acc.get("stage") or "No tag"), 0) + 1
+        for stage in (_csv_list(acc.get("stage")) or ["No tag"]):
+            stage_counts[stage] = stage_counts.get(stage, 0) + 1
     return JSONResponse([
         {"name": stage, "count": count}
         for stage, count in sorted(stage_counts.items(), key=lambda x: x[0].lower())
@@ -343,7 +379,7 @@ def api_profile_import(data: Dict[str, Any]) -> JSONResponse:
             name = str(parsed.get("name") or parsed.get("email") or "").strip()
             if not name:
                 name = f"profile{len(db_get_accounts()) + 1}"
-            account: Dict[str, Any] = {"name": name, "stage": default_stage, "extra_fields": dict(parsed)}
+            account: Dict[str, Any] = {"name": name, "stage": default_stage, "proxy_pool": proxy_pool, "extra_fields": dict(parsed)}
             for key, value in parsed.items():
                 account[str(key)] = str(value)
             db_add_account(account)
@@ -396,6 +432,14 @@ def api_profile_save(name: str, data: Dict[str, Any]) -> JSONResponse:
     else:
         updates["__delete_keys__"] = [settings_key]
     db_update_account(name, updates)
+    _assigned_proxies.pop(name, None)
+    _assigned_proxies.pop(clean_name, None)
+    proxy_index = str(data.get("proxy_index") or "").strip()
+    if updates["proxy_pool"] and proxy_index:
+        try:
+            _assign_specific_proxy(updates["proxy_pool"], int(proxy_index), clean_name)
+        except Exception:
+            return JSONResponse({"ok": False, "error": "Invalid proxy selection"}, 400)
     broadcast_log(f"Profile {clean_name} saved")
     return JSONResponse({"ok": True})
 
@@ -520,23 +564,34 @@ def api_profile_start(name: str) -> JSONResponse:
     return JSONResponse({"ok": True, "status": "starting", "cdp_port": cdp_port, "cdp_url": f"http://127.0.0.1:{cdp_port}" if cdp_port else "", "headless": False, "vnc_port": vnc_info.get("vnc_port") if vnc_info else 0, "display": display_str})
 @app.post("/api/profiles/{name}/stop")
 def api_profile_stop(name: str) -> JSONResponse:
-    info = _live_browsers.pop(name, None)
+    info = _live_browsers.get(name)
     if info is None:
         return JSONResponse({"ok": False, "error": "Not running"}, 404)
     browser = info.get("browser") if isinstance(info, dict) else info
+    cdp_port = int((info.get("cdp_port") if isinstance(info, dict) else 0) or 0)
     if browser is None:
         return JSONResponse({"ok": False, "error": "Not running"}, 404)
 
     def worker() -> None:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        closed = False
         try:
             loop.run_until_complete(browser.close(force=True))
-        except RuntimeError:
-            LOGGER.info("Browser %s already closed (event-loop mismatch)", name)
+            closed = True
+        except RuntimeError as exc:
+            LOGGER.info("Browser %s close hit event-loop mismatch: %s", name, exc)
         except Exception:
             LOGGER.exception("Browser stop failed for %s", name)
         finally:
+            if not closed:
+                try:
+                    closed = bool(browser.force_kill_profile_processes(cdp_port))
+                except Exception:
+                    LOGGER.exception("Browser force kill failed for %s", name)
+            if not closed:
+                broadcast_log(f"Cannot stop browser for {name}")
+                _live_browsers[name] = info
             loop.close()
 
     threading.Thread(target=worker, daemon=True).start()
@@ -582,7 +637,7 @@ def _on_browser_failed(name: str, browser: Any, exc: Exception) -> None:
         if acc:
             pool = str(acc.get("proxy_pool") or "")
             if pool:
-                _release_pool_proxy(pool, name)
+                _assigned_proxies.pop(name, None)
     except Exception:
         pass
     broadcast_log(f"Cannot start {name}: {exc}")
@@ -594,14 +649,14 @@ def _on_browser_closed(name: str, browser: Any) -> None:
         get_virtual_display_manager().stop(name)
     except Exception:
         pass
-    # Release pool proxy if assigned
+    # Clear runtime proxy cache only; assigned_to is a persistent profile setting.
     try:
         accs = db_get_accounts()
         acc = next((a for a in accs if str(a.get("name") or "") == name), None)
         if acc:
             pool = str(acc.get("proxy_pool") or "")
             if pool:
-                _release_pool_proxy(pool, name)
+                _assigned_proxies.pop(name, None)
     except Exception:
         pass
     broadcast_log(f"Browser closed for {name}")
@@ -819,7 +874,7 @@ def api_proxy_pool_import(name: str, data: Dict[str, Any]) -> JSONResponse:
         line = line.strip()
         if not line or line in existing:
             continue
-        proxies.append({"value": line, "assigned_to": "", "status": "idle"})
+        proxies.append({"name": f"Proxy #{len(proxies) + 1}", "value": line, "assigned_to": "", "status": "idle", "country": "", "region": "", "tags": ""})
         existing.add(line)
         added += 1
     pool["proxies"] = proxies
@@ -845,30 +900,64 @@ def api_proxy_delete(name: str, data: Dict[str, Any]) -> JSONResponse:
 def api_proxy_assign(name: str, data: Dict[str, Any]) -> JSONResponse:
     idx = int(data.get("index", -1) if data.get("index") is not None else -1)
     profile = str(data.get("profile") or "").strip()
+    profiles = _csv_list(data.get("profiles")) or _csv_list(profile)
     pools = _load_proxy_pools()
     if name not in pools:
         return JSONResponse({"ok": False, "error": "Pool not found"}, 404)
     proxies = pools[name].get("proxies") or []
     if idx < 0 or idx >= len(proxies):
         return JSONResponse({"ok": False, "error": "Invalid proxy index"}, 400)
-    # Release previous assignment if any
-    old_assigned = str(proxies[idx].get("assigned_to") or "").strip()
+    old_target = set(_csv_list(proxies[idx].get("assigned_to")))
     # Assign or release
-    if profile:
-        # Check profile not already assigned to another proxy
+    if profiles:
+        # Check profile not already assigned to another proxy in this pool
         for i, px in enumerate(proxies):
-            if i != idx and profile in [a.strip() for a in str(px.get("assigned_to") or "").split(",") if a.strip()]:
-                px["assigned_to"] = ""
-                px["status"] = "idle"
-        proxies[idx]["assigned_to"] = profile
+            if i == idx:
+                continue
+            old_assigned = set(_csv_list(px.get("assigned_to")))
+            assigned = [p for p in _csv_list(px.get("assigned_to")) if p not in profiles]
+            for profile_name in old_assigned - set(assigned):
+                _assigned_proxies.pop(profile_name, None)
+            px["assigned_to"] = ", ".join(assigned)
+            px["status"] = "in use" if assigned else "idle"
+        for profile_name in old_target - set(profiles):
+            _assigned_proxies.pop(profile_name, None)
+        proxies[idx]["assigned_to"] = ", ".join(profiles)
         proxies[idx]["status"] = "in use"
-        broadcast_log(f"Proxy {idx+1} in pool {name} assigned to {profile}")
+        _sync_profile_proxy(name, proxies[idx])
+        broadcast_log(f"Proxy {idx+1} in pool {name} assigned to {', '.join(profiles)}")
     else:
+        for profile_name in _csv_list(proxies[idx].get("assigned_to")):
+            _assigned_proxies.pop(profile_name, None)
         proxies[idx]["assigned_to"] = ""
         proxies[idx]["status"] = "idle"
         broadcast_log(f"Proxy {idx+1} in pool {name} released")
     pools[name]["proxies"] = proxies
     db_set_setting("proxy_pools", json.dumps(pools, ensure_ascii=False))
+    return JSONResponse({"ok": True})
+
+@app.put("/api/proxies/pool/{name}/proxies/{idx}")
+def api_proxy_update(name: str, idx: int, data: Dict[str, Any]) -> JSONResponse:
+    pools = _load_proxy_pools()
+    if name not in pools:
+        return JSONResponse({"ok": False, "error": "Pool not found"}, 404)
+    proxies = pools[name].get("proxies") or []
+    if idx < 0 or idx >= len(proxies):
+        return JSONResponse({"ok": False, "error": "Invalid proxy index"}, 400)
+    proxy = proxies[idx]
+    if not isinstance(proxy, dict):
+        return JSONResponse({"ok": False, "error": "Invalid proxy"}, 400)
+    old_assigned = set(_csv_list(proxy.get("assigned_to")))
+    for key in ("name", "value", "country", "region", "tags"):
+        proxy[key] = str(data.get(key) or "").strip()
+    proxy["assigned_to"] = ", ".join(_csv_list(data.get("assigned_to")))
+    proxy["status"] = "in use" if proxy["assigned_to"] else "idle"
+    for profile_name in old_assigned - set(_csv_list(proxy.get("assigned_to"))):
+        _assigned_proxies.pop(profile_name, None)
+    _sync_profile_proxy(name, proxy)
+    pools[name]["proxies"] = proxies
+    db_set_setting("proxy_pools", json.dumps(pools, ensure_ascii=False))
+    broadcast_log(f"Proxy {idx+1} in pool {name} updated")
     return JSONResponse({"ok": True})
 
 # ============================================================

@@ -4,6 +4,7 @@ import locale
 import logging
 import os
 import random
+import signal
 import socket
 import subprocess
 import sys
@@ -1143,7 +1144,10 @@ class BrowserInterface:
                 await self.context.close()
         finally:
             if self._camoufox_ctx:
-                await self._camoufox_ctx.__aexit__(None, None, None)
+                try:
+                    await self._camoufox_ctx.__aexit__(None, None, None)
+                except Exception:
+                    pass
                 self._camoufox_ctx = None
             if self.browser:
                 try:
@@ -1159,6 +1163,104 @@ class BrowserInterface:
             self._notify_process_exited()
             self._notify_browser_closed()
             self._ready_notified = False
+
+    def force_kill_profile_processes(self, cdp_port: int = 0) -> bool:
+        if not sys.platform.startswith("win"):
+            return self._force_kill_profile_processes_posix(cdp_port)
+        env = dict(os.environ)
+        env["_CAMOUFLOW_PROFILE_DIR"] = str(self.user_data_dir)
+        env["_CAMOUFLOW_CDP_PORT"] = str(int(cdp_port or 0))
+        ps_kill = (
+            "$target=$env:_CAMOUFLOW_PROFILE_DIR; "
+            "$port=[int]$env:_CAMOUFLOW_CDP_PORT; "
+            "$rx=[regex]::Escape($target); "
+            "$procs=Get-CimInstance Win32_Process | Where-Object { "
+            "  $_.CommandLine -and $_.CommandLine -match $rx -and "
+            "  $_.Name -notin @('node.exe','python.exe','pythonw.exe','powershell.exe') "
+            "}; "
+            "if($port -gt 0){ "
+            "  $owners=Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; "
+            "  foreach($owner in $owners){ $procs += Get-CimInstance Win32_Process -Filter \"ProcessId=$owner\" -ErrorAction SilentlyContinue } "
+            "}; "
+            "$count=0; "
+            "foreach($p in ($procs | Where-Object { $_ } | Sort-Object ProcessId -Unique)){ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue; $count++ }; "
+            "$count"
+        )
+        try:
+            out = subprocess.check_output(
+                ["powershell", "-NoProfile", "-Command", ps_kill],
+                env=env,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+            )
+            killed = int((out or "0").strip() or "0")
+        except Exception:
+            killed = 0
+        if killed:
+            self.browser = None
+            self.context = None
+            self.page = None
+            self._camoufox_ctx = None
+            self._cloakbrowser_context = None
+            self._notify_process_exited()
+            self._notify_browser_closed()
+            self._ready_notified = False
+        return killed > 0
+
+    def _force_kill_profile_processes_posix(self, cdp_port: int = 0) -> bool:
+        needles = [str(self.user_data_dir)]
+        if cdp_port:
+            needles.append(f"--remote-debugging-port={int(cdp_port)}")
+        try:
+            out = subprocess.check_output(
+                ["ps", "-eo", "pid=,args="],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+            )
+        except Exception:
+            return False
+
+        current_pid = os.getpid()
+        targets: List[int] = []
+        for line in out.splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) != 2:
+                continue
+            try:
+                pid = int(parts[0])
+            except ValueError:
+                continue
+            cmdline = parts[1]
+            if pid == current_pid or "python" in cmdline.lower():
+                continue
+            if any(needle and needle in cmdline for needle in needles):
+                targets.append(pid)
+
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid in targets:
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    self.logger.exception("Failed to signal browser process %s", pid)
+            if sig == signal.SIGTERM and targets:
+                time.sleep(1.0)
+
+        if targets:
+            self.browser = None
+            self.context = None
+            self.page = None
+            self._camoufox_ctx = None
+            self._cloakbrowser_context = None
+            self._notify_process_exited()
+            self._notify_browser_closed()
+            self._ready_notified = False
+        return bool(targets)
 
     def add_process_exit_callback(self, callback: Callable[[], None]) -> None:
         if not callable(callback):
