@@ -6,12 +6,9 @@ The **Settings** page shows application-level runtime information.
 
 - **Data root** shows where CamouFlow stores local data:
   - profiles
-  - scenarios
   - proxy pools
-  - shared variables
   - browser settings
   - logs
-  - outputs
 
 ## Browser settings moved to Browser
 

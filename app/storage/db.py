@@ -6,7 +6,6 @@ import shutil
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -72,7 +71,6 @@ SETTINGS_DIR = DATA_ROOT / "settings"
 ACCOUNTS_FILE = SETTINGS_DIR / "accounts.json"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 PROFILES_DIR = DATA_ROOT / "profiles"
-SCENARIOS_DIR = DATA_ROOT / "scenaries"
 
 # Backward-compatible export (older code imports PROJECT_ROOT)
 PROJECT_ROOT = DATA_ROOT
@@ -133,18 +131,6 @@ CLOAKBROWSER_DEFAULTS: Dict[str, Any] = {
 BROWSER_ENGINES = {"camoufox", "cloakbrowser"}
 DEFAULT_BROWSER_ENGINE = "camoufox"
 
-SAMPLE_SCENARIO = {
-    "name": "Demo scenario",
-    "description": "Sample scenario",
-    "steps": [
-        {"action": "goto", "url": "https://example.com", "wait_until": "load", "label": "start"},
-        {"action": "wait_element", "selector": "body", "selector_type": "css", "timeout_ms": 10000},
-        {"action": "sleep", "seconds": 1.5},
-    ],
-}
-sample_steps = SAMPLE_SCENARIO["steps"]
-
-
 def get_defined_stages() -> List[str]:
     """
     Return user-defined stages from settings; no built-in defaults.
@@ -163,14 +149,6 @@ def get_defined_stages() -> List[str]:
         return []
     return []
 
-
-@dataclass
-class Scenario:
-    name: str
-    steps: List[Dict]
-    description: Optional[str] = None
-
-
 def _safe_profile_name(email: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]", "_", email or "profile")
 
@@ -179,50 +157,14 @@ def profile_dir_for_email(email: str) -> Path:
     return PROFILES_DIR / _safe_profile_name(email)
 
 
-def _safe_scenario_name(name: str) -> str:
-    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "_", name.strip() or "scenario")
-    return cleaned[:120]
-
-
-def _scenario_path(name: str) -> Path:
-    return SCENARIOS_DIR / f"{_safe_scenario_name(name)}.json"
-
-
-def _scenario_file_for_name(name: str) -> Path:
-    """Return the file path for a scenario name, falling back to scanning all files."""
-    direct = _scenario_path(name)
-    if direct.exists():
-        return direct
-    for path in SCENARIOS_DIR.glob("*.json"):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if str(data.get("name") or path.stem) == name:
-                return path
-        except Exception:
-            continue
-    return direct
-
-
 def _ensure_storage() -> None:
     SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
     PROFILES_DIR.mkdir(exist_ok=True)
-    SCENARIOS_DIR.mkdir(exist_ok=True)
     OUTPUTS_DIR.mkdir(exist_ok=True)
     if not ACCOUNTS_FILE.exists():
         _atomic_write_text(ACCOUNTS_FILE, "[]", encoding="utf-8")
     if not SETTINGS_FILE.exists():
         _atomic_write_text(SETTINGS_FILE, "{}", encoding="utf-8")
-
-    # Seed bundled scenarios to user storage (best-effort).
-    try:
-        bundled_dir = _resource_root() / "scenaries"
-        if bundled_dir.exists():
-            for src in bundled_dir.glob("*.json"):
-                dst = SCENARIOS_DIR / src.name
-                if not dst.exists():
-                    shutil.copy2(str(src), str(dst))
-    except Exception:
-        LOGGER.exception("Failed to seed bundled scenarios")
 
 
 def _next_profile_name(existing: List[Dict[str, Any]]) -> str:
@@ -247,19 +189,6 @@ def init_db() -> None:
     Initialize JSON storage.
     """
     _ensure_storage()
-
-    # Seed sample scenario in filesystem storage if none exist
-    if not any(SCENARIOS_DIR.glob("*.json")):
-        sample_path = SCENARIOS_DIR / "demo_scenario.json"
-        sample_payload = {
-            "name": "Demo scenario",
-            "description": "Sample scenario",
-            "steps": sample_steps,
-        }
-        try:
-            sample_path.write_text(json.dumps(sample_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception:
-            pass
 
 
 def _load_accounts_raw() -> List[Dict]:
@@ -540,58 +469,6 @@ def db_delete_selector_index(selector: str) -> None:
     mapping.pop(str(selector), None)
     settings["selector_indices"] = mapping
     _save_settings(settings)
-
-
-def db_get_scenarios() -> List[Scenario]:
-    scenarios: List[Scenario] = []
-    for path in sorted(SCENARIOS_DIR.glob("*.json")):
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            name = str(data.get("name") or path.stem)
-            steps = data.get("steps") or []
-            desc = data.get("description")
-            scenarios.append(Scenario(name=name, steps=steps, description=desc))
-        except Exception:
-            continue
-    scenarios.sort(key=lambda s: s.name)
-    return scenarios
-
-
-def db_get_scenario(name: str) -> Optional[Scenario]:
-    path = _scenario_file_for_name(name)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        steps = data.get("steps") or []
-        desc = data.get("description")
-        real_name = data.get("name") or name
-        return Scenario(name=str(real_name), steps=steps, description=desc)
-    except Exception:
-        return None
-
-
-def db_get_scenario_path(name: str) -> Path:
-    """
-    Return the JSON file path for a scenario name, scanning existing scenario files
-    when necessary (e.g. if the file name differs from the stored scenario name).
-    """
-    return _scenario_file_for_name(name)
-
-
-def db_save_scenario(name: str, steps: List[Dict], description: Optional[str] = None) -> None:
-    existing = _scenario_file_for_name(name)
-    path = existing if existing.exists() else _scenario_path(name)
-    payload = {"name": name, "description": description, "steps": steps or []}
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def db_delete_scenario(name: str) -> None:
-    path = _scenario_file_for_name(name)
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
 
 
 def cleanup_profiles(accounts: List[Dict[str, Any]]) -> None:

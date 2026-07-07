@@ -10,7 +10,6 @@ ROOT = Path(SPECPATH).resolve()
 
 datas = [
     (str(ROOT / "logo.ico"), "."),
-    (str(ROOT / "scenaries"), "scenaries"),
     (str(ROOT / "app" / "static"), "app/static"),
 ]
 

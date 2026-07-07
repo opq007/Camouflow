@@ -1,1 +1,0 @@
-"""QML bridge package."""

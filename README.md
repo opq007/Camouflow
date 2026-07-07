@@ -1,12 +1,10 @@
 # CamouFlow
 
-CamouFlow is a local desktop workspace for browser profiles, proxies and visual automation scenarios.
+CamouFlow is a local desktop workspace for browser profiles and proxies.
 
-The app is built with **Python + FastAPI/HTML** and runs automation through **Camoufox / CloakBrowser** with local storage for profiles, settings, scenarios, proxy pools and logs. The UI is served as a web app in your default browser, making it cross-platform (Windows, Linux, macOS).
+The app is built with **Python + FastAPI/HTML** and runs automation through **Camoufox / CloakBrowser** with local storage for profiles, settings, proxy pools and logs. The UI is served as a web app in your default browser, making it cross-platform (Windows, Linux, macOS).
 
 ## Screenshots
-
-> **Note:** Screenshots below show the pre-refactor PyQt6 UI. The HTML UI follows the same premium dark theme and page layout.
 
 | Dashboard | Profiles |
 |---|---|
@@ -16,15 +14,15 @@ The app is built with **Python + FastAPI/HTML** and runs automation through **Ca
 |---|---|
 | ![Browser settings](images/browser.png) | ![Proxies](images/proxies.png) |
 
-| Scenarios | Logs |
-|---|---|
-| ![Scenarios](images/scenarios.png) | ![Logs](images/logs.png) |
+| Logs |
+|---|
+| ![Logs](images/logs.png) |
 
 ## Current features
 
 ### Dashboard
 
-- profile, browser, scenario and proxy counters
+- profile, browser and proxy counters
 - running session list
 - recent activity feed
 - quick navigation actions
@@ -37,7 +35,6 @@ The app is built with **Python + FastAPI/HTML** and runs automation through **Ca
 - assign proxy data to a profile
 - manage profile tags
 - edit profile variables and cookies
-- run a scenario for profiles matching a tag
 - per-profile browser overrides:
   - locale
   - timezone
@@ -72,38 +69,6 @@ The app is built with **Python + FastAPI/HTML** and runs automation through **Ca
 - health checks per proxy or group
 - pool statistics: active, checking, failed, locations
 
-### Scenarios
-
-- visual node-based scenario editor (HTML canvas)
-- draggable steps on a canvas
-- pan/zoom canvas navigation
-- success/error links between steps
-- right-click context actions for nodes and links
-- scenario library: create, duplicate, delete, save
-- run selected scenario on a selected profile
-- step editor with raw JSON preview
-
-Supported step types:
-
-- start / end
-- open URL
-- HTTP request
-- wait for element
-- wait for page load
-- sleep
-- click
-- type text
-- set variable
-- parse variable
-- pop from shared variables
-- extract text
-- write file
-- compare / if
-- open, switch and close browser tabs
-- set tag
-- run another scenario
-- log/message
-
 ### Logs
 
 - application and automation event log
@@ -122,17 +87,15 @@ Supported step types:
 app/
   core/              browser integration, fingerprints, proxies
   server.py           FastAPI server and REST API endpoints
-  services/          scenario engine and executable steps
   static/            HTML/CSS/JS frontend (SPA)
   storage/           local database/storage helpers
   ui/http_app.py     entry point bootstrap (uvicorn + browser open)
   utils/             general helpers (logging, parsing)
 docs-site/           Retype-based documentation (Markdown -> GH Pages)
 images/              current screenshots used by README
-scenaries/           example scenario JSON files
 ```
 
-> The old `app/ui/bridge/`, `app/ui/tabs/`, `app/ui/qml_app.py`, and `app/qml/` directories contain the legacy PyQt6 UI layer and are no longer imported by the active code path.
+The legacy PyQt6/QML UI has been removed; the HTML SPA is the only active UI.
 
 ## Requirements
 
@@ -201,7 +164,6 @@ python -m compileall app
 CamouFlow stores working data locally:
 
 - profiles
-- scenarios
 - proxies
 - settings
 - logs

@@ -2,7 +2,7 @@
 const API = '/api';
 let currentPage = 'dashboard';
 let logSocket = null;
-let stateCache = { profiles: [], scenarios: [], browserSettings: {}, proxies: [] };
+let stateCache = { profiles: [], browserSettings: {}, proxies: [] };
 
 // ========== Navigation ==========
 function navigate(page) {
@@ -75,7 +75,6 @@ function loadPage(page) {
     case 'profiles': loadProfiles(); break;
     case 'browser': loadBrowser(); break;
     case 'proxies': loadProxies(); break;
-    case 'scenarios': loadScenarios(); break;
     case 'logs': loadLogs(); break;
     case 'settings': loadSettings(); break;
   }
@@ -89,7 +88,6 @@ async function loadDashboard() {
   const items = [
     ['Profiles', metrics.profiles || 0, 'profiles'],
     ['Running', metrics.running || 0, 'profiles'],
-    ['Scenarios', metrics.scenarios || 0, 'scenarios'],
     ['Proxies', metrics.proxy_total || 0, 'proxies'],
   ];
   grid.innerHTML = items.map(i => `<div class="stat-card"><div class="stat-value">${i[1]}</div><div class="stat-label">${i[0]}</div></div>`).join('');
@@ -329,214 +327,6 @@ async function proxiesDelete(poolName, index) {
   toast('Proxy removed'); loadProxies();
 }
 function proxiesRefresh() { loadProxies(); }
-
-// ===== SCENARIOS =====
-async function loadScenarios() {
-  const data = await apiGet('/scenarios');
-  const list = document.getElementById('scenarios-list');
-  list.innerHTML = data.length === 0
-    ? '<div style="color:var(--text-muted);text-align:center;padding:20px">No scenarios yet</div>'
-    : data.map(s => `<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border-subtle)">
-      <div><strong>${escHtml(s.name)}</strong> <span style="color:var(--text-muted);font-size:12px">${s.steps} steps</span><br><span style="color:var(--text-secondary);font-size:12px">${escHtml(s.description||'')}</span></div>
-      <div class="btn-group">
-        <button class="btn btn-sm btn-success" onclick="scenariosRun('${escJs(s.name)}')">Run</button>
-        <button class="btn btn-sm" onclick="scenariosEdit('${escJs(s.name)}')">Edit</button>
-        <button class="btn btn-sm" onclick="scenariosDuplicate('${escJs(s.name)}')">Duplicate</button>
-        <button class="btn btn-sm btn-danger" onclick="scenariosDelete('${escJs(s.name)}')">Delete</button>
-      </div></div>`).join('');
-}
-async function scenariosCreate() { const r = await apiPost('/scenarios/create'); toast('Scenario created'); loadScenarios(); }
-function scenariosRefresh() { loadScenarios(); }
-async function scenariosRun(name) {
-  showModal('Run Scenario: ' + name, `
-    <div class="form-group"><label>Profile (leave empty to run on all)</label><input id="sr-profile" placeholder="Profile name"></div>
-    <div class="form-group"><label>Max Accounts</label><input id="sr-max" value="1" type="number"></div>
-  `, async () => { const r = await apiPost('/scenarios/' + encodeURIComponent(name) + '/run', { profile: g('sr-profile'), max_accounts: parseInt(g('sr-max')) || 1 }); toast(r.ok ? 'Scenario started' : (r.error || 'Error')); });
-}
-async function scenariosDuplicate(name) { const r = await apiPost('/scenarios/' + encodeURIComponent(name) + '/duplicate'); if (r.ok) { toast('Duplicated as ' + r.name); loadScenarios(); } }
-async function scenariosDelete(name) { if (confirm('Delete scenario ' + name + '?')) { await apiDelete('/scenarios/' + encodeURIComponent(name)); toast('Scenario deleted'); loadScenarios(); } }
-async function scenariosEdit(name) {
-  const data = await apiGet('/scenarios/' + encodeURIComponent(name));
-  if (!data.name) return;
-  const actions = await apiGet('/scenarios/actions');
-  const editor = document.getElementById('scenario-editor');
-  const list = document.getElementById('scenarios-list');
-  list.style.display = 'none'; editor.style.display = 'flex';
-
-  const categories = actions.categories || [];
-  const options = actions.options || [];
-
-  editor.innerHTML = `
-<div class="scenario-panel left">
-  <div class="card-title">${escHtml(data.name)}</div>
-  <div style="color:var(--text-muted);font-size:12px">${data.steps.length} steps</div>
-  <div style="margin-top:12px"><textarea id="se-desc" style="min-height:40px">${escHtml(data.description||'')}</textarea></div>
-  <div class="btn-group" style="margin-top:12px">
-    <button class="btn btn-sm btn-primary" onclick="scenariosSave('${escJs(name)}')">Save</button>
-    <button class="btn btn-sm btn-ghost" onclick="scenariosCloseEditor()">Back</button>
-  </div>
-  <div style="margin-top:20px"><div class="card-title" style="margin-bottom:8px">Steps</div>
-    <div id="se-step-list" style="max-height:300px;overflow-y:auto">${data.steps.map((s,i) => `<div style="padding:6px 8px;margin:3px 0;border-radius:8px;cursor:pointer;background:rgba(255,255,255,0.03);font-size:12px;display:flex;justify-content:space-between" onclick="scenariosSelectStep(${i})" id="se-step-${i}">
-      <span>${i+1}. ${escHtml(s.label||s.action)}</span>
-      <span style="color:var(--text-muted)">${escHtml(s.tag||'')}</span>
-    </div>`).join('')}</div>
-  </div>
-</div>
-<div class="scenario-canvas-wrap" id="se-canvas-wrap">
-  <canvas id="scenario-canvas"></canvas>
-</div>
-<div class="scenario-panel right" id="se-step-props">
-  <div class="card-title">Step Properties</div>
-  <div id="se-step-form"><div style="color:var(--text-muted);padding:20px;text-align:center">Select a step to edit</div></div>
-</div>
-  `;
-  window._seData = data;
-  window._seActions = actions;
-  window._seSelected = -1;
-  setTimeout(() => drawScenarioCanvas(), 100);
-}
-function scenariosCloseEditor() {
-  document.getElementById('scenario-editor').style.display = 'none';
-  document.getElementById('scenarios-list').style.display = 'block';
-  loadScenarios();
-}
-async function scenariosSave(oldName) {
-  const data = window._seData;
-  if (!data) return;
-  data.description = document.getElementById('se-desc')?.value || '';
-  const r = await apiPut('/scenarios/' + encodeURIComponent(oldName), { name: data.name, description: data.description, steps: (data.steps||[]).map(s => { const {index, label, extra, ...clean} = s; return clean; }) });
-  if (r.ok) { toast('Scenario saved'); scenariosCloseEditor(); }
-}
-function scenariosSelectStep(idx) {
-  window._seSelected = idx;
-  document.querySelectorAll('[id^="se-step-"]').forEach(el => el.style.background = 'rgba(255,255,255,0.03)');
-  const el = document.getElementById('se-step-' + idx);
-  if (el) el.style.background = 'rgba(139,92,246,0.2)';
-  renderStepForm(idx);
-  drawScenarioCanvas();
-}
-function renderStepForm(idx) {
-  const data = window._seData;
-  if (!data || idx < 0 || idx >= data.steps.length) return;
-  const s = data.steps[idx];
-  const form = document.getElementById('se-step-form');
-  form.innerHTML = `
-    <div class="form-group"><label>Action</label><select id="ss-action">${(window._seActions.options||[]).map(o => `<option value="${o.value}" ${o.value===s.action?'selected':''}>${o.label}</option>`).join('')}</select></div>
-    <div class="form-group"><label>Tag</label><input id="ss-tag" value="${escHtml(s.tag||'')}"></div>
-    <div class="form-group"><label>Next Success Tag</label><input id="ss-ok" value="${escHtml(s.nextOk||'')}"></div>
-    <div class="form-group"><label>Next Error Tag</label><input id="ss-err" value="${escHtml(s.nextErr||'')}"></div>
-    <div class="form-group"><label>Selector</label><input id="ss-selector" value="${escHtml(s.selector||'')}"></div>
-    <div class="form-group"><label>URL / Value</label><input id="ss-value" value="${escHtml(s.url||s.value||'')}"></div>
-    <div class="form-row"><div class="form-group"><label>Timeout (ms)</label><input id="ss-timeout" value="${s.timeout_ms||''}" type="number"></div>
-    <div class="form-group"><label>Seconds</label><input id="ss-seconds" value="${s.seconds||''}" type="number" step="0.1"></div></div>
-    <div class="btn-group" style="margin-top:12px">
-      <button class="btn btn-sm btn-primary" onclick="scenariosApplyStep(${idx})">Apply</button>
-      <button class="btn btn-sm btn-danger" onclick="scenariosDeleteStep(${idx})">Delete</button>
-    </div>
-  `;
-}
-async function scenariosApplyStep(idx) {
-  const data = window._seData;
-  if (!data || idx < 0) return;
-  data.steps[idx] = {
-    ...data.steps[idx],
-    action: document.getElementById('ss-action')?.value || data.steps[idx].action,
-    tag: document.getElementById('ss-tag')?.value || '',
-    next_success_step: document.getElementById('ss-ok')?.value || '',
-    next_error_step: document.getElementById('ss-err')?.value || '',
-    selector: document.getElementById('ss-selector')?.value || '',
-    url: document.getElementById('ss-value')?.value || '',
-    value: document.getElementById('ss-value')?.value || '',
-    timeout_ms: parseInt(document.getElementById('ss-timeout')?.value) || undefined,
-    seconds: parseFloat(document.getElementById('ss-seconds')?.value) || undefined,
-  };
-  toast('Step updated'); drawScenarioCanvas();
-  // Update step list
-  const el = document.getElementById('se-step-' + idx);
-  if (el) el.querySelector('span:first-child').textContent = (idx+1) + '. ' + (data.steps[idx].action || '');
-}
-async function scenariosDeleteStep(idx) {
-  if (idx <= 0) { toast('Start step cannot be deleted'); return; }
-  if (!confirm('Delete step ' + (idx+1) + '?')) return;
-  const data = window._seData;
-  data.steps.splice(idx, 1);
-  window._seSelected = Math.max(0, idx - 1);
-  toast('Step deleted');
-  scenariosCloseEditor();
-  setTimeout(() => scenariosEdit(data.name), 100);
-}
-
-// ===== Scenario Canvas =====
-function drawScenarioCanvas() {
-  const data = window._seData;
-  if (!data) return;
-  const canvas = document.getElementById('scenario-canvas');
-  const wrap = document.getElementById('se-canvas-wrap');
-  if (!canvas || !wrap) return;
-  canvas.width = wrap.clientWidth;
-  canvas.height = wrap.clientHeight;
-  const ctx = canvas.getContext('2d');
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-  // Grid
-  ctx.strokeStyle = 'rgba(255,255,255,0.07)';
-  ctx.lineWidth = 1;
-  for (let x = 0; x < canvas.width; x += 24) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
-  for (let y = 0; y < canvas.height; y += 24) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); }
-
-  const steps = data.steps || [];
-  if (!steps.length) return;
-  const nodeW = 220, nodeH = 76, hGap = 100, vGap = 48;
-  const positions = steps.map((s, i) => {
-    const px = s._pos && s._pos.x ? s._pos.x : hGap + i * (nodeW + hGap);
-    const py = s._pos && s._pos.y ? s._pos.y : vGap + 80;
-    return { x: px + 40, y: py, w: nodeW, h: nodeH };
-  });
-
-  // Draw links
-  steps.forEach((s, i) => {
-    const nextOk = s.next_success_step || s.nextOk;
-    const nextErr = s.next_error_step || s.nextErr;
-    if (nextOk) {
-      const dst = steps.findIndex(step => (step.tag || '') === nextOk);
-      if (dst >= 0) drawArrow(ctx, positions[i], positions[dst], '#8b5cf6');
-    }
-    if (nextErr) {
-      const dst = steps.findIndex(step => (step.tag || '') === nextErr);
-      if (dst >= 0) drawArrow(ctx, positions[i], positions[dst], '#ef4444');
-    }
-  });
-
-  // Draw nodes
-  positions.forEach((p, i) => {
-    const isStart = i === 0;
-    const selected = i === window._seSelected;
-    ctx.fillStyle = isStart ? 'rgba(6,182,212,0.2)' : 'rgba(22,22,42,0.9)';
-    ctx.strokeStyle = selected ? '#a78bfa' : isStart ? '#06b6d4' : 'rgba(255,255,255,0.12)';
-    ctx.lineWidth = selected ? 2 : 1;
-    ctx.beginPath(); roundRect(ctx, p.x, p.y, p.w, p.h, 10); ctx.fill(); ctx.stroke();
-
-    ctx.fillStyle = '#8b5cf6'; ctx.font = 'bold 11px sans-serif';
-    ctx.fillText('Step ' + (i+1) + '.', p.x + 14, p.y + 24);
-    ctx.fillStyle = '#e8e8f0'; ctx.font = 'bold 12px sans-serif';
-    ctx.fillText(truncate(steps[i].action || '', 30), p.x + 14, p.y + 46);
-    ctx.fillStyle = '#b0b0c8'; ctx.font = '9px monospace';
-    const sub = steps[i].url || steps[i].value || steps[i].selector || '';
-    if (sub) ctx.fillText(truncate(sub, 30), p.x + 14, p.y + 64);
-
-    // Connectors
-    ctx.fillStyle = '#a78bfa'; ctx.beginPath(); ctx.arc(p.x - 8, p.y + p.h/2, 4, 0, Math.PI*2); ctx.fill();
-    ctx.fillStyle = '#8b5cf6'; ctx.beginPath(); ctx.arc(p.x + p.w + 8, p.y + p.h/2, 6, 0, Math.PI*2); ctx.fill();
-  });
-}
-function drawArrow(ctx, from, to, color) {
-  const sx = from.x + from.w + 8, sy = from.y + from.h/2;
-  const tx = to.x - 8, ty = to.y + to.h/2;
-  ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.setLineDash([4, 5]);
-  ctx.beginPath(); ctx.moveTo(sx, sy); ctx.lineTo(tx, ty); ctx.stroke(); ctx.setLineDash([]);
-}
-function roundRect(ctx, x, y, w, h, r) { ctx.moveTo(x+r, y); ctx.lineTo(x+w-r, y); ctx.quadraticCurveTo(x+w, y, x+w, y+r); ctx.lineTo(x+w, y+h-r); ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h); ctx.lineTo(x+r, y+h); ctx.quadraticCurveTo(x, y+h, x, y+h-r); ctx.lineTo(x, y+r); ctx.quadraticCurveTo(x, y, x+r, y); }
-function truncate(s, n) { return s && s.length > n ? s.slice(0, n-2) + '..' : s||''; }
 
 // ===== LOGS =====
 async function loadLogs() {

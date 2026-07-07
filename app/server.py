@@ -1,4 +1,4 @@
-﻿"""FastAPI server replacing the PyQt6/QML bridge layer."""
+﻿"""FastAPI server for the HTML CamouFlow UI."""
 
 from __future__ import annotations
 
@@ -18,19 +18,13 @@ from app.core.virtual_display import get_virtual_display_manager
 from app.storage.db import (
     CAMOUFOX_DEFAULTS,
     CLOAKBROWSER_DEFAULTS,
-    Scenario,
     db_add_account,
     db_delete_account,
-    db_delete_scenario,
     db_get_accounts,
     db_get_browser_engine,
     db_get_camoufox_defaults,
     db_get_cloakbrowser_defaults,
-    db_get_scenario,
-    db_get_scenario_path,
-    db_get_scenarios,
     db_get_setting,
-    db_save_scenario,
     db_set_browser_engine,
     db_set_camoufox_defaults,
     db_set_cloakbrowser_defaults,
@@ -266,7 +260,6 @@ def api_dashboard() -> JSONResponse:
     from app.ui.dashboard_data import build_dashboard_metrics, recent_log_lines
     metrics = build_dashboard_metrics(
         db_get_accounts(),
-        db_get_scenarios(),
         _load_proxy_pools(),
         _live_browsers,
     )
@@ -660,159 +653,6 @@ def _on_browser_closed(name: str, browser: Any) -> None:
     except Exception:
         pass
     broadcast_log(f"Browser closed for {name}")
-
-# ============================================================
-# Scenarios
-# ============================================================
-
-ACTION_OPTIONS = [
-    ("Start scenario", "start"), ("Open URL", "goto"), ("HTTP request", "http_request"),
-    ("Wait for element", "wait_element"), ("Wait for page load", "wait_for_load_state"),
-    ("Sleep", "sleep"), ("Click element", "click"), ("Type text", "type"),
-    ("Set variable", "set_var"), ("Parse variable", "parse_var"), ("Pop from shared", "pop_shared"),
-    ("Extract text", "extract_text"), ("Write to file", "write_file"),
-    ("Compare / if", "compare"), ("Open new tab", "new_tab"), ("Switch tab", "switch_tab"),
-    ("Close tab", "close_tab"), ("Set tag", "set_tag"), ("Close browser", "end"),
-    ("Run another scenario", "run_scenario"), ("Log / message", "log"),
-]
-ACTION_LABELS = {value: label for label, value in ACTION_OPTIONS}
-ACTION_CATEGORIES = [
-    ("Navigation & interaction", ["goto", "wait_for_load_state", "wait_element", "sleep", "click", "type"]),
-    ("Variables", ["set_var", "parse_var", "pop_shared", "extract_text", "write_file"]),
-    ("Network", ["http_request"]),
-    ("Browser tabs", ["new_tab", "switch_tab", "close_tab"]),
-    ("Flow & logging", ["start", "end", "run_scenario", "log", "set_tag", "compare"]),
-]
-
-@app.get("/api/scenarios")
-def api_scenarios_list() -> JSONResponse:
-    scenarios = db_get_scenarios()
-    return JSONResponse([
-        {"name": s.name, "description": s.description or "", "steps": len(s.steps or [])}
-        for s in scenarios
-    ])
-
-@app.get("/api/scenarios/actions")
-def api_scenario_actions() -> JSONResponse:
-    return JSONResponse({
-        "options": [{"label": l, "value": v} for l, v in ACTION_OPTIONS],
-        "categories": [{"name": n, "actions": a} for n, a in ACTION_CATEGORIES],
-    })
-
-@app.get("/api/scenarios/{name}")
-def api_scenario_get(name: str) -> JSONResponse:
-    scenario = db_get_scenario(name)
-    if not scenario:
-        return JSONResponse({}, 404)
-    steps = scenario.steps or []
-    result = []
-    for idx, step in enumerate(steps):
-        action = str(step.get("action") or "")
-        result.append({
-            "index": idx,
-            "action": action,
-            "label": ACTION_LABELS.get(action, action),
-            "tag": str(step.get("tag") or ""),
-            "nextOk": str(step.get("next_success_step") or ""),
-            "nextErr": str(step.get("next_error_step") or ""),
-            "selector": str(step.get("selector") or ""),
-            "selector_type": str(step.get("selector_type") or ""),
-            "value": str(step.get("value") or ""),
-            "url": str(step.get("url") or ""),
-            "timeout_ms": step.get("timeout_ms"),
-            "seconds": step.get("seconds"),
-            "_pos": step.get("_pos"),
-            "extra": json.dumps({k: v for k, v in step.items() if k not in {
-                "action", "label", "tag", "next_success_step", "next_error_step",
-                "selector", "selector_type", "value", "url", "timeout_ms", "seconds", "_pos"
-            }}, ensure_ascii=False, indent=2),
-        })
-    return JSONResponse({
-        "name": scenario.name,
-        "description": scenario.description or "",
-        "steps": result,
-    })
-
-@app.post("/api/scenarios/create")
-def api_scenario_create() -> JSONResponse:
-    base = "New scenario"
-    existing = {s.name.lower() for s in db_get_scenarios()}
-    name = base
-    idx = 2
-    while name.lower() in existing:
-        name = f"{base} {idx}"
-        idx += 1
-    db_save_scenario(name, [{"action": "start", "tag": "Start"}], "")
-    broadcast_log(f"Scenario {name} created")
-    return JSONResponse({"ok": True, "name": name})
-
-@app.put("/api/scenarios/{name}")
-def api_scenario_save(name: str, data: Dict[str, Any]) -> JSONResponse:
-    new_name = str(data.get("name") or name).strip() or name
-    description = str(data.get("description") or "")
-    steps = data.get("steps") or []
-    if not isinstance(steps, list):
-        steps = []
-    db_save_scenario(new_name, steps, description)
-    if name != new_name:
-        db_delete_scenario(name)
-    broadcast_log(f"Scenario {new_name} saved")
-    return JSONResponse({"ok": True, "name": new_name})
-
-@app.delete("/api/scenarios/{name}")
-def api_scenario_delete(name: str) -> JSONResponse:
-    db_delete_scenario(name)
-    broadcast_log(f"Scenario {name} deleted")
-    return JSONResponse({"ok": True})
-
-@app.post("/api/scenarios/{name}/duplicate")
-def api_scenario_duplicate(name: str) -> JSONResponse:
-    scenario = db_get_scenario(name)
-    if not scenario:
-        return JSONResponse({"ok": False}, 404)
-    base = f"{name} copy"
-    existing = {s.name.lower() for s in db_get_scenarios()}
-    new_name = base
-    idx = 2
-    while new_name.lower() in existing:
-        new_name = f"{base} {idx}"
-        idx += 1
-    import copy
-    steps = copy.deepcopy(scenario.steps or [])
-    db_save_scenario(new_name, steps, scenario.description or "")
-    broadcast_log(f"Scenario duplicated as {new_name}")
-    return JSONResponse({"ok": True, "name": new_name})
-
-@app.post("/api/scenarios/{name}/run")
-def api_scenario_run(name: str, data: Dict[str, Any] = {}) -> JSONResponse:
-    profile = str(data.get("profile") or "").strip()
-    max_accounts = int(data.get("max_accounts") or 1)
-    tag = str(data.get("tag") or "").strip()
-    scenario = db_get_scenario(name)
-    if not scenario:
-        return JSONResponse({"ok": False, "error": "Scenario not found"}, 404)
-    all_accounts = db_get_accounts()
-    if profile:
-        accounts = [a for a in all_accounts if str(a.get("name") or "") == profile]
-    elif tag and tag != "All tags":
-        accounts = [a for a in all_accounts if str(a.get("stage") or "No tag") == tag]
-    else:
-        accounts = all_accounts[:max_accounts]
-    if not accounts:
-        return JSONResponse({"ok": False, "error": "No profiles to run"}, 400)
-
-    def worker() -> None:
-        try:
-            processed = run_scenario(accounts, scenario, max_accounts=min(max_accounts, len(accounts)),
-                                     scenario_path=db_get_scenario_path(scenario.name))
-            broadcast_log(f"Scenario finished: {len(processed)} profile(s)")
-        except Exception as exc:
-            LOGGER.exception("Scenario run failed")
-            broadcast_log(f"Scenario failed: {exc}")
-
-    broadcast_log(f"Running {scenario.name}")
-    threading.Thread(target=worker, daemon=True).start()
-    return JSONResponse({"ok": True})
 
 # ============================================================
 # Proxies

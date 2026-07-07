@@ -33,18 +33,19 @@ def proxy_pool_stats(proxy_pools: Mapping[str, Mapping[str, Any]]) -> Dict[str, 
 
 def build_dashboard_metrics(
     accounts: Iterable[Mapping[str, Any]],
-    scenarios: Iterable[Any],
     proxy_pools: Mapping[str, Mapping[str, Any]],
-    live_browsers: Mapping[str, Any],
+    live_browsers: Mapping[str, Any] | None = None,
+    maybe_live_browsers: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    if maybe_live_browsers is not None:
+        proxy_pools, live_browsers = live_browsers or {}, maybe_live_browsers
+    live_browsers = live_browsers or {}
     account_list = list(accounts)
-    scenario_list = list(scenarios)
     proxy_stats = proxy_pool_stats(proxy_pools)
     stages = Counter(str(account.get("stage") or "Undefined") for account in account_list)
     return {
         "profiles": len(account_list),
         "running": len(live_browsers),
-        "scenarios": len(scenario_list),
         "proxy_total": proxy_stats["total"],
         "proxy_healthy": proxy_stats["healthy"],
         "proxy_assigned": proxy_stats["assigned"],

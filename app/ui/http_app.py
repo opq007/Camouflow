@@ -1,4 +1,4 @@
-"""HTTP application bootstrap for CamouFlow (replaces QML)."""
+"""HTTP application bootstrap for CamouFlow."""
 
 from __future__ import annotations
 
