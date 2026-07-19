@@ -4,9 +4,7 @@ import locale
 import logging
 import os
 import random
-import signal
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -14,8 +12,9 @@ from contextlib import contextmanager
 from pathlib import Path
 import urllib.request
 import urllib.parse
-from typing import Any, Callable, Dict, List, Optional, Sequence, cast
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, cast
 
+import psutil
 import socks
 
 from app.storage.db import (
@@ -26,6 +25,22 @@ from app.storage.db import (
 )
 from .locale_mapping import country_to_locale
 from .proxy_utils import LocalSocksProxyServer, ProxyDetails, parse_proxy
+
+# Host process names we must never kill while cleaning up browser sessions.
+_HOST_PROCESS_NAMES = frozenset(
+    {
+        "python",
+        "python3",
+        "pythonw",
+        "powershell",
+        "pwsh",
+        "bash",
+        "sh",
+        "zsh",
+        "dash",
+        "fish",
+    }
+)
 
 
 AsyncCamoufox = Any
@@ -204,6 +219,15 @@ class BrowserInterface:
             self._proxy_logger.warning(msg)
         self._local_proxy: Optional[LocalSocksProxyServer] = None
         self._process_watchdog_started = False
+        # Long-lived asyncio loop: Playwright/Camoufox async objects must be closed
+        # on the same loop that created them. Closing the loop right after start()
+        # breaks graceful shutdown and amplifies pipe EPIPE on force-kill.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop_thread: Optional[threading.Thread] = None
+        self._loop_ready = threading.Event()
+        self._loop_lock = threading.Lock()
+        self._loop_stopping = False
+        self._tracked_pids: List[int] = []
 
     def _init_proxy_logger(self) -> logging.LoggerAdapter:
         proxy_logger = logging.getLogger("proxy_log")
@@ -977,10 +1001,346 @@ class BrowserInterface:
             self.logger.warning("Timezone lookup failed via geo API: %s", geo_data)
         return None
 
+    def _ensure_loop(self) -> asyncio.AbstractEventLoop:
+        """Start (or reuse) a dedicated event loop thread for this browser session."""
+        with self._loop_lock:
+            loop = self._loop
+            thread = self._loop_thread
+            if loop is not None and thread is not None and thread.is_alive() and not self._loop_stopping:
+                if not loop.is_closed():
+                    return loop
+
+            self._loop_ready.clear()
+            self._loop_stopping = False
+            ready = self._loop_ready
+            holder: Dict[str, Any] = {}
+
+            def _runner() -> None:
+                new_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(new_loop)
+                holder["loop"] = new_loop
+                ready.set()
+                try:
+                    new_loop.run_forever()
+                finally:
+                    try:
+                        pending = asyncio.all_tasks(new_loop)
+                        for task in pending:
+                            task.cancel()
+                        if pending:
+                            new_loop.run_until_complete(
+                                asyncio.gather(*pending, return_exceptions=True)
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        new_loop.close()
+                    except Exception:
+                        pass
+
+            thread = threading.Thread(
+                target=_runner,
+                name=f"browser-loop-{self.profile_name}",
+                daemon=True,
+            )
+            self._loop_thread = thread
+            thread.start()
+            if not ready.wait(timeout=10):
+                raise RuntimeError(f"Timed out starting event loop for {self.profile_name}")
+            loop = holder.get("loop")
+            if loop is None:
+                raise RuntimeError(f"Failed to start event loop for {self.profile_name}")
+            self._loop = loop
+            return loop
+
+    def run_coro(self, coro, timeout: Optional[float] = 180.0):
+        """Run a coroutine on this browser's dedicated loop and wait for the result."""
+        loop = self._ensure_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        try:
+            if timeout is None:
+                return future.result()
+            return future.result(timeout=timeout)
+        except Exception:
+            future.cancel()
+            raise
+
+    def shutdown_loop(self) -> None:
+        """Stop the dedicated event loop after browser resources are released."""
+        with self._loop_lock:
+            loop = self._loop
+            thread = self._loop_thread
+            self._loop_stopping = True
+            self._loop = None
+            self._loop_thread = None
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except Exception:
+                pass
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+
+    def _remember_process_pid(self, pid: Optional[int]) -> None:
+        try:
+            value = int(pid or 0)
+        except (TypeError, ValueError):
+            return
+        if value > 1 and value not in self._tracked_pids:
+            self._tracked_pids.append(value)
+
+    def _capture_browser_pids(self) -> None:
+        """Best-effort capture of browser/driver PIDs for targeted force-kill."""
+        candidates = [self.browser, self.context, self._cloakbrowser_context]
+        for obj in candidates:
+            if obj is None:
+                continue
+            process = getattr(obj, "process", None)
+            if process is not None:
+                self._remember_process_pid(getattr(process, "pid", None))
+            for attr in ("pid", "_pid"):
+                self._remember_process_pid(getattr(obj, attr, None))
+        # Discover related PIDs via psutil (profile path / CDP) right after launch.
+        for pid in self._find_profile_related_pids(cdp_port=0):
+            self._remember_process_pid(pid)
+
+    @staticmethod
+    def _process_base_name(name: str) -> str:
+        base = Path(str(name or "")).name.lower()
+        if base.endswith(".exe"):
+            base = base[:-4]
+        return base
+
+    @staticmethod
+    def _normalize_path_token(value: str) -> str:
+        return os.path.normcase(os.path.normpath(str(value or ""))).replace("\\", "/")
+
+    def _profile_cmdline_needles(self, cdp_port: int = 0) -> List[str]:
+        needles: List[str] = []
+        profile = str(self.user_data_dir or "")
+        if profile:
+            needles.append(profile)
+            needles.append(self._normalize_path_token(profile))
+        if cdp_port:
+            needles.append(f"--remote-debugging-port={int(cdp_port)}")
+            needles.append(f"remote-debugging-port={int(cdp_port)}")
+        # Drop empties / duplicates while preserving order.
+        seen: Set[str] = set()
+        ordered: List[str] = []
+        for item in needles:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            ordered.append(item)
+        return ordered
+
+    def _is_host_process(self, proc: psutil.Process, cmdline: str) -> bool:
+        """Return True for the CamouFlow host process (never kill ourselves)."""
+        try:
+            if proc.pid == os.getpid() or proc.pid == os.getppid():
+                return True
+        except Exception:
+            pass
+        try:
+            name = self._process_base_name(proc.name())
+        except (psutil.Error, TypeError, ValueError):
+            name = ""
+        if name in _HOST_PROCESS_NAMES:
+            # Pure host interpreters / shells are protected.
+            return True
+        lower = (cmdline or "").lower()
+        # Defensive: treat other python* names as host unless clearly a browser helper.
+        if name.startswith("python") and "playwright" not in lower and "camoufox" not in lower:
+            return True
+        return False
+
+    def _process_matches_profile(
+        self,
+        proc: psutil.Process,
+        needles: Sequence[str],
+        *,
+        include_node: bool = True,
+    ) -> bool:
+        try:
+            if not proc.is_running():
+                return False
+        except psutil.Error:
+            return False
+
+        try:
+            cmdline_list = proc.cmdline() or []
+        except (psutil.Error, TypeError, ValueError):
+            cmdline_list = []
+        cmdline = " ".join(str(part) for part in cmdline_list)
+        cmdline_norm = self._normalize_path_token(cmdline)
+
+        if self._is_host_process(proc, cmdline):
+            return False
+
+        try:
+            name = self._process_base_name(proc.name())
+        except (psutil.Error, TypeError, ValueError):
+            name = ""
+
+        # For watchdog existence checks we care about real browser processes,
+        # not the Playwright node driver alone (driver may linger briefly).
+        if not include_node and name in {"node", "nodejs"}:
+            return False
+
+        if proc.pid in self._tracked_pids:
+            return True
+
+        for needle in needles:
+            if not needle:
+                continue
+            if needle in cmdline or self._normalize_path_token(needle) in cmdline_norm:
+                return True
+        return False
+
+    def _pids_listening_on_port(self, port: int) -> Set[int]:
+        """Cross-platform: PIDs with a listening socket on the given local port."""
+        found: Set[int] = set()
+        if port <= 0:
+            return found
+        try:
+            # Prefer process_iter net connections when available; fall back to
+            # net_connections for broader coverage.
+            for conn in psutil.net_connections(kind="inet"):
+                try:
+                    if conn.status != psutil.CONN_LISTEN:
+                        continue
+                    laddr = conn.laddr
+                    if not laddr:
+                        continue
+                    lport = getattr(laddr, "port", None)
+                    if lport is None and isinstance(laddr, (tuple, list)) and len(laddr) >= 2:
+                        lport = laddr[1]
+                    if int(lport or 0) != int(port):
+                        continue
+                    if conn.pid:
+                        found.add(int(conn.pid))
+                except (psutil.Error, TypeError, ValueError, AttributeError):
+                    continue
+        except (psutil.Error, PermissionError, OSError):
+            # Restricted environments may deny net_connections; ignore.
+            pass
+        return found
+
+    def _find_profile_related_pids(
+        self,
+        cdp_port: int = 0,
+        *,
+        include_node: bool = True,
+    ) -> List[int]:
+        """
+        Discover browser / Playwright driver PIDs related to this profile.
+
+        Matching rules (OR):
+        - tracked PIDs captured at launch
+        - command line contains profile user-data path
+        - command line / listeners match CDP remote-debugging port
+        """
+        needles = self._profile_cmdline_needles(cdp_port=cdp_port)
+        targets: Set[int] = set()
+
+        for pid in list(self._tracked_pids):
+            if pid > 1:
+                targets.add(int(pid))
+
+        for pid in self._pids_listening_on_port(int(cdp_port or 0)):
+            targets.add(pid)
+
+        try:
+            iterator = psutil.process_iter(attrs=["pid", "name", "cmdline"])
+        except Exception:
+            iterator = []
+
+        for proc in iterator:
+            try:
+                if self._process_matches_profile(proc, needles, include_node=include_node):
+                    targets.add(int(proc.pid))
+            except (psutil.Error, TypeError, ValueError):
+                continue
+
+        # Expand to children of matched roots so orphaned renderer helpers go too.
+        expanded: Set[int] = set(targets)
+        for pid in list(targets):
+            try:
+                parent = psutil.Process(pid)
+            except (psutil.Error, ValueError):
+                continue
+            try:
+                for child in parent.children(recursive=True):
+                    try:
+                        if self._is_host_process(child, " ".join(child.cmdline() or [])):
+                            continue
+                    except (psutil.Error, TypeError, ValueError):
+                        pass
+                    expanded.add(int(child.pid))
+            except (psutil.Error, TypeError, ValueError):
+                continue
+
+        current = os.getpid()
+        return sorted(pid for pid in expanded if pid > 1 and pid != current)
+
+    def _profile_browser_process_exists(self, cdp_port: int = 0) -> bool:
+        """True if a non-node browser process for this profile is still alive."""
+        return bool(self._find_profile_related_pids(cdp_port=cdp_port, include_node=False))
+
+    def _kill_pids(self, pids: Sequence[int], *, graceful_seconds: float = 1.0) -> int:
+        """
+        Terminate then kill the given PIDs. Returns number of PIDs we attempted
+        to stop (best-effort; already-dead PIDs still count as handled).
+        """
+        processes: List[psutil.Process] = []
+        seen: Set[int] = set()
+        for raw in pids:
+            try:
+                pid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if pid <= 1 or pid == os.getpid() or pid in seen:
+                continue
+            seen.add(pid)
+            try:
+                proc = psutil.Process(pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+                continue
+            try:
+                if self._is_host_process(proc, " ".join(proc.cmdline() or [])):
+                    continue
+            except (psutil.Error, TypeError, ValueError):
+                pass
+            processes.append(proc)
+
+        if not processes:
+            return 0
+
+        for proc in processes:
+            try:
+                proc.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            except Exception:
+                self.logger.exception("Failed to terminate browser process %s", proc.pid)
+
+        _, alive = psutil.wait_procs(processes, timeout=max(0.1, float(graceful_seconds)))
+        for proc in alive:
+            try:
+                proc.kill()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            except Exception:
+                self.logger.exception("Failed to kill browser process %s", proc.pid)
+        if alive:
+            psutil.wait_procs(alive, timeout=1.0)
+        return len(processes)
+
     async def start(self):
         self._closed_notified = False
         self._process_exited_notified = False
         self._close_listener_attached = False
+        self._tracked_pids = []
         if self.proxy and not self._proxy_config:
             msg = f"Proxy configured for {self.profile_name} but failed to parse; browser launch aborted."
             self.logger.error(msg)
@@ -1006,6 +1366,7 @@ class BrowserInterface:
             self.page = self.context.pages[0]
         else:
             self.page = await self.context.new_page()
+        self._capture_browser_pids()
         self._attach_close_listeners()
         if self._process_exit_callbacks:
             self._start_process_watchdog()
@@ -1077,43 +1438,19 @@ class BrowserInterface:
 
     def _start_process_watchdog(self) -> None:
         """
-        Best-effort watchdog that fires process-exit callbacks when the browser window/process exits.
-
-        Uses a Windows process lookup by profile directory when possible. Falls back to no-op on other platforms.
+        Best-effort watchdog that fires process-exit callbacks when the browser
+        window/process exits. Cross-platform via psutil (Windows / Linux / macOS).
         """
         if self._process_watchdog_started:
             return
         self._process_watchdog_started = True
 
         def worker() -> None:
-            if not sys.platform.startswith("win"):
-                return
-
-            env = dict(os.environ)
-            env["_CAMOUFLOW_PROFILE_DIR"] = str(self.user_data_dir)
-            ps_exists = (
-                "$target=$env:_CAMOUFLOW_PROFILE_DIR; "
-                "$rx=[regex]::Escape($target); "
-                "$p=Get-CimInstance Win32_Process | Where-Object { "
-                "  $_.CommandLine -and $_.CommandLine -match $rx -and "
-                "  $_.Name -notin @('node.exe','python.exe','pythonw.exe','powershell.exe') "
-                "} | Select-Object -First 1; "
-                "if($p){'1'} else {'0'}"
-            )
-
             seen = False
-            # Wait until the browser process appears; then wait until it disappears.
+            # Wait until a browser process appears; then wait until it disappears.
             while not getattr(self, "_process_exited_notified", False):
                 try:
-                    out = subprocess.check_output(
-                        ["powershell", "-NoProfile", "-Command", ps_exists],
-                        env=env,
-                        stderr=subprocess.DEVNULL,
-                        text=True,
-                        encoding="utf-8",
-                        errors="ignore",
-                    )
-                    exists = (out or "").strip() == "1"
+                    exists = self._profile_browser_process_exists()
                 except Exception:
                     exists = False
 
@@ -1129,9 +1466,15 @@ class BrowserInterface:
             self._notify_process_exited()
             self._notify_browser_closed()
 
-        threading.Thread(target=worker, daemon=True).start()
+        threading.Thread(
+            target=worker,
+            name=f"browser-watchdog-{self.profile_name}",
+            daemon=True,
+        ).start()
 
     async def close(self, force: bool = False):
+        # keep_browser_open only applies to intentional mid-session soft close.
+        # Process exit and API stop always pass force=True.
         if self.keep_browser_open and (self.browser or self.context) and not force:
             self.logger.info("Keeping %s session for %s open; force close when finished.", self.browser_engine, self.profile_name)
             return
@@ -1139,9 +1482,15 @@ class BrowserInterface:
         self.logger.info("Closing %s resources for %s", self.browser_engine, self.profile_name)
         try:
             if self.page:
-                await self.page.close()
+                try:
+                    await self.page.close()
+                except Exception:
+                    pass
             if self.context:
-                await self.context.close()
+                try:
+                    await self.context.close()
+                except Exception:
+                    pass
         finally:
             if self._camoufox_ctx:
                 try:
@@ -1155,112 +1504,88 @@ class BrowserInterface:
                 except Exception:
                     pass
             if self._local_proxy:
-                self._local_proxy.stop()
+                try:
+                    self._local_proxy.stop()
+                except Exception:
+                    pass
                 self._local_proxy = None
             self.browser = None
             self.context = None
             self.page = None
+            self._cloakbrowser_context = None
             self._notify_process_exited()
             self._notify_browser_closed()
             self._ready_notified = False
+
+    def close_sync(
+        self,
+        force: bool = True,
+        timeout: float = 30.0,
+        cdp_port: int = 0,
+    ) -> bool:
+        """
+        Close browser resources on the session loop, then stop the loop.
+
+        Returns True when the session appears closed (graceful or force-killed).
+        """
+        closed = False
+        try:
+            if self._loop is not None and not self._loop.is_closed():
+                self.run_coro(self.close(force=force), timeout=timeout)
+                closed = True
+            else:
+                # Loop already gone — fall through to force kill.
+                closed = False
+        except Exception as exc:
+            self.logger.info("Browser %s close_sync failed: %s", self.profile_name, exc)
+            closed = False
+        finally:
+            if not closed:
+                try:
+                    closed = bool(self.force_kill_profile_processes(cdp_port=cdp_port))
+                except Exception:
+                    self.logger.exception("Browser force kill failed for %s", self.profile_name)
+            self.shutdown_loop()
+        return closed
 
     def force_kill_profile_processes(self, cdp_port: int = 0) -> bool:
-        if not sys.platform.startswith("win"):
-            return self._force_kill_profile_processes_posix(cdp_port)
-        env = dict(os.environ)
-        env["_CAMOUFLOW_PROFILE_DIR"] = str(self.user_data_dir)
-        env["_CAMOUFLOW_CDP_PORT"] = str(int(cdp_port or 0))
-        ps_kill = (
-            "$target=$env:_CAMOUFLOW_PROFILE_DIR; "
-            "$port=[int]$env:_CAMOUFLOW_CDP_PORT; "
-            "$rx=[regex]::Escape($target); "
-            "$procs=Get-CimInstance Win32_Process | Where-Object { "
-            "  $_.CommandLine -and $_.CommandLine -match $rx -and "
-            "  $_.Name -notin @('node.exe','python.exe','pythonw.exe','powershell.exe') "
-            "}; "
-            "if($port -gt 0){ "
-            "  $owners=Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; "
-            "  foreach($owner in $owners){ $procs += Get-CimInstance Win32_Process -Filter \"ProcessId=$owner\" -ErrorAction SilentlyContinue } "
-            "}; "
-            "$count=0; "
-            "foreach($p in ($procs | Where-Object { $_ } | Sort-Object ProcessId -Unique)){ Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue; $count++ }; "
-            "$count"
-        )
+        """
+        Cross-platform force kill for profile-related browser/driver processes.
+
+        Uses psutil on Windows, Linux, and macOS. Targets:
+        - tracked launch PIDs
+        - processes whose command line references the profile user-data dir
+        - processes listening on the profile CDP port
+        - recursive children of the above
+        Never kills the host Python/shell process.
+        """
         try:
-            out = subprocess.check_output(
-                ["powershell", "-NoProfile", "-Command", ps_kill],
-                env=env,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-            )
-            killed = int((out or "0").strip() or "0")
+            targets = self._find_profile_related_pids(cdp_port=int(cdp_port or 0), include_node=True)
+            killed = self._kill_pids(targets, graceful_seconds=1.0)
         except Exception:
+            self.logger.exception("psutil force kill failed for %s", self.profile_name)
             killed = 0
-        if killed:
-            self.browser = None
-            self.context = None
-            self.page = None
-            self._camoufox_ctx = None
-            self._cloakbrowser_context = None
-            self._notify_process_exited()
-            self._notify_browser_closed()
-            self._ready_notified = False
+        self._clear_session_handles_after_kill(killed > 0)
         return killed > 0
 
-    def _force_kill_profile_processes_posix(self, cdp_port: int = 0) -> bool:
-        needles = [str(self.user_data_dir)]
-        if cdp_port:
-            needles.append(f"--remote-debugging-port={int(cdp_port)}")
-        try:
-            out = subprocess.check_output(
-                ["ps", "-eo", "pid=,args="],
-                stderr=subprocess.DEVNULL,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-            )
-        except Exception:
-            return False
-
-        current_pid = os.getpid()
-        targets: List[int] = []
-        for line in out.splitlines():
-            parts = line.strip().split(None, 1)
-            if len(parts) != 2:
-                continue
+    def _clear_session_handles_after_kill(self, killed: bool) -> None:
+        if not killed:
+            return
+        self.browser = None
+        self.context = None
+        self.page = None
+        self._camoufox_ctx = None
+        self._cloakbrowser_context = None
+        self._tracked_pids = []
+        if self._local_proxy:
             try:
-                pid = int(parts[0])
-            except ValueError:
-                continue
-            cmdline = parts[1]
-            if pid == current_pid or "python" in cmdline.lower():
-                continue
-            if any(needle and needle in cmdline for needle in needles):
-                targets.append(pid)
-
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            for pid in targets:
-                try:
-                    os.kill(pid, sig)
-                except ProcessLookupError:
-                    pass
-                except Exception:
-                    self.logger.exception("Failed to signal browser process %s", pid)
-            if sig == signal.SIGTERM and targets:
-                time.sleep(1.0)
-
-        if targets:
-            self.browser = None
-            self.context = None
-            self.page = None
-            self._camoufox_ctx = None
-            self._cloakbrowser_context = None
-            self._notify_process_exited()
-            self._notify_browser_closed()
-            self._ready_notified = False
-        return bool(targets)
+                self._local_proxy.stop()
+            except Exception:
+                pass
+            self._local_proxy = None
+        self._notify_process_exited()
+        self._notify_browser_closed()
+        self._ready_notified = False
 
     def add_process_exit_callback(self, callback: Callable[[], None]) -> None:
         if not callable(callback):

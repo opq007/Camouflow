@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import socket
 import sys
 import threading
@@ -44,7 +43,7 @@ def run_http_app(argv: list[str] | None = None) -> int:
     url = f"http://{host}:{port}"
 
     # Mount static files before starting
-    from app.server import app, mount_static
+    from app.server import app, mount_static, shutdown_all_browsers
     mount_static(static_dir)
 
     LOGGER.info("CamouFlow server starting at %s", url)
@@ -57,7 +56,12 @@ def run_http_app(argv: list[str] | None = None) -> int:
 
     threading.Thread(target=_open_browser, daemon=True).start()
 
-    # Run uvicorn in the main thread
+    # Run uvicorn in the main thread.
+    # Browser cleanup is handled by:
+    #   1) FastAPI lifespan shutdown
+    #   2) atexit.register(shutdown_all_browsers)
+    #   3) this finally block (covers KeyboardInterrupt / abrupt run exit)
+    # Hard Task Manager kills cannot be intercepted; EPIPE may still appear then.
     try:
         uvicorn.run(
             app,
@@ -67,5 +71,13 @@ def run_http_app(argv: list[str] | None = None) -> int:
             access_log=False,
         )
     except KeyboardInterrupt:
-        pass
+        try:
+            shutdown_all_browsers("keyboard interrupt")
+        except Exception:
+            LOGGER.exception("Browser shutdown on KeyboardInterrupt failed")
+    finally:
+        try:
+            shutdown_all_browsers("http app exit")
+        except Exception:
+            pass
     return 0
