@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import locale
 import logging
@@ -521,7 +522,23 @@ class BrowserInterface:
             kwargs["exclude_addons"] = exclude_list
         if window_tuple:
             kwargs["window"] = window_tuple
-        if merged.get("block_webrtc"):
+
+        if proxy_applied:
+            exit_ip = self._detect_proxy_exit_ip()
+            if exit_ip:
+                config_overrides[f"webrtc:ipv{ipaddress.ip_address(exit_ip).version}"] = exit_ip
+                kwargs["firefox_user_prefs"] = {
+                    "media.peerconnection.ice.default_address_only": True,
+                    "media.peerconnection.ice.no_host": True,
+                    "media.peerconnection.ice.proxy_only_if_behind_proxy": True,
+                }
+            else:
+                kwargs["block_webrtc"] = True
+                self._proxy_logger.error(
+                    "Proxy WebRTC IP detection failed for %s; WebRTC disabled.",
+                    self.profile_name,
+                )
+        elif merged.get("block_webrtc"):
             kwargs["block_webrtc"] = True
         if merged.get("block_images"):
             kwargs["block_images"] = True
@@ -635,6 +652,8 @@ class BrowserInterface:
                 ]
             )
         args.extend(self._split_setting_list(merged.get("launch_args")))
+        if self._proxy_config and not any(a.startswith("--fingerprint-webrtc-ip") for a in args):
+            args.append("--fingerprint-webrtc-ip=auto")
 
         width = merged.get("screen_width") or merged.get("window_width")
         height = merged.get("screen_height") or merged.get("window_height")
@@ -929,10 +948,12 @@ class BrowserInterface:
             try:
                 data = _open_with_proxy(
                     opener,
-                    "http://ip-api.com/json/?fields=countryCode,status,message,timezone",
+                    "http://ip-api.com/json/?fields=query,countryCode,status,message,timezone",
                 )
                 if data.get("status") == "success" and data.get("countryCode"):
                     response = {"success": True, "country_code": data.get("countryCode")}
+                    if data.get("query"):
+                        response["ip"] = data.get("query")
                     if data.get("timezone"):
                         response["timezone"] = data.get("timezone")
                     return response
@@ -940,6 +961,40 @@ class BrowserInterface:
             except Exception as exc:
                 last_error = str(exc)
         return {"success": False, "error": last_error or "unknown"}
+
+    @staticmethod
+    def _geo_response_ip(data: Optional[dict]) -> str:
+        if not isinstance(data, dict):
+            return ""
+        for key in ("ip", "query"):
+            value = str(data.get(key) or "").strip()
+            if not value:
+                continue
+            try:
+                ipaddress.ip_address(value)
+                return value
+            except ValueError:
+                continue
+        return ""
+
+    def _detect_proxy_exit_ip(self) -> str:
+        if not self._proxy_config:
+            return ""
+        data = self._fetch_country_via_proxy()
+        exit_ip = self._geo_response_ip(data)
+        if exit_ip:
+            self._proxy_logger.info(
+                "WebRTC exit IP detected via proxy %s -> %s",
+                self._current_proxy_host_label(),
+                exit_ip,
+            )
+            return exit_ip
+        self._proxy_logger.error(
+            "WebRTC exit IP not detected via proxy %s; payload: %s",
+            self._current_proxy_host_label(),
+            data,
+        )
+        return ""
 
     @staticmethod
     def _country_to_locale(country: str) -> str:
