@@ -1,12 +1,15 @@
-﻿"""FastAPI server for the HTML CamouFlow UI."""
+"""FastAPI server for the HTML CamouFlow UI."""
 
 from __future__ import annotations
 
+import atexit
 import asyncio
 import json
 import logging
 import socket
 import threading
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -36,13 +39,19 @@ from app.utils.parsing import DEFAULT_ACCOUNT_TEMPLATE, parse_account_line
 
 LOGGER = logging.getLogger(__name__)
 
-app = FastAPI(title="CamouFlow")
-
 # --- Log streaming state ---
 _log_clients: List[WebSocket] = []
 _log_messages: List[str] = []
 _log_queue: List[str] = []
 _loop: asyncio.AbstractEventLoop | None = None
+_flush_task: asyncio.Task | None = None
+
+# --- Live browser tracking ---
+_live_browsers: Dict[str, Any] = {}  # name -> {browser, cdp_port, engine}
+_live_browsers_lock = threading.RLock()
+_shutdown_started = False
+_shutdown_lock = threading.Lock()
+
 
 def _install_loop() -> None:
     """Capture the running event loop for thread-safe log broadcasting."""
@@ -51,6 +60,7 @@ def _install_loop() -> None:
         _loop = asyncio.get_running_loop()
     except RuntimeError:
         pass
+
 
 async def _flush_log_queue() -> None:
     """Coroutine that runs on the event loop to send queued messages."""
@@ -72,16 +82,139 @@ async def _flush_log_queue() -> None:
             if ws in _log_clients:
                 _log_clients.remove(ws)
 
+
 def broadcast_log(message: str) -> None:
     _log_messages.append(message)
     if len(_log_messages) > 1000:
         _log_messages[:] = _log_messages[-500:]
     _log_queue.append(message)
     if _loop is not None:
-        _loop.call_soon_threadsafe(lambda: None)  # wake the loop
+        try:
+            _loop.call_soon_threadsafe(lambda: None)  # wake the loop
+        except Exception:
+            pass
 
-# --- Live browser tracking ---
-_live_browsers: Dict[str, Any] = {}  # name -> {browser, cdp_port, engine}
+
+def _snapshot_live_browsers() -> List[tuple[str, Any, int]]:
+    with _live_browsers_lock:
+        items: List[tuple[str, Any, int]] = []
+        for name, info in list(_live_browsers.items()):
+            browser = info.get("browser") if isinstance(info, dict) else info
+            cdp_port = int((info.get("cdp_port") if isinstance(info, dict) else 0) or 0)
+            items.append((name, browser, cdp_port))
+        return items
+
+
+def shutdown_all_browsers(reason: str = "app shutdown") -> None:
+    """
+    Best-effort graceful close of every live browser session.
+
+    Must run on process exit (lifespan + atexit). Force-kills leftovers so the
+    Playwright Node driver pipe is torn down from our side instead of via EPIPE.
+    """
+    global _shutdown_started
+    with _shutdown_lock:
+        items = _snapshot_live_browsers()
+        if not items:
+            if not _shutdown_started:
+                LOGGER.info("No live browsers to close on %s", reason)
+            return
+        if _shutdown_started:
+            # Another shutdown path already claimed the live set; still clear if empty later.
+            return
+        _shutdown_started = True
+
+    broadcast_log(f"Closing {len(items)} browser session(s) ({reason})")
+    LOGGER.info("Closing %s browser session(s) on %s", len(items), reason)
+
+    def _close_one(name: str, browser: Any, cdp_port: int) -> None:
+        if browser is None:
+            return
+        try:
+            close_sync = getattr(browser, "close_sync", None)
+            if callable(close_sync):
+                close_sync(force=True, timeout=20.0, cdp_port=cdp_port)
+                return
+            # Fallback for unexpected objects
+            force_kill = getattr(browser, "force_kill_profile_processes", None)
+            if callable(force_kill):
+                force_kill(cdp_port)
+        except Exception:
+            LOGGER.exception("Failed to close browser session %s during %s", name, reason)
+            try:
+                force_kill = getattr(browser, "force_kill_profile_processes", None)
+                if callable(force_kill):
+                    force_kill(cdp_port)
+            except Exception:
+                pass
+        finally:
+            with _live_browsers_lock:
+                current = _live_browsers.get(name)
+                if current and (
+                    current is browser
+                    or (isinstance(current, dict) and current.get("browser") is browser)
+                ):
+                    _live_browsers.pop(name, None)
+            try:
+                get_virtual_display_manager().stop(name)
+            except Exception:
+                pass
+
+    threads: List[threading.Thread] = []
+    for name, browser, cdp_port in items:
+        t = threading.Thread(
+            target=_close_one,
+            args=(name, browser, cdp_port),
+            name=f"shutdown-browser-{name}",
+            daemon=True,
+        )
+        threads.append(t)
+        t.start()
+
+    deadline = time.time() + 25.0
+    for t in threads:
+        remaining = max(0.1, deadline - time.time())
+        t.join(timeout=remaining)
+
+    with _live_browsers_lock:
+        leftover = list(_live_browsers.keys())
+        _live_browsers.clear()
+    if leftover:
+        LOGGER.warning("Live browsers still tracked after shutdown: %s", leftover)
+    try:
+        get_virtual_display_manager().stop_all()
+    except Exception:
+        pass
+    broadcast_log(f"Browser cleanup finished ({reason})")
+
+
+@asynccontextmanager
+async def _app_lifespan(app: FastAPI):
+    global _flush_task, _shutdown_started
+    _shutdown_started = False
+    _install_loop()
+    _flush_task = asyncio.create_task(_flush_log_queue())
+    LOGGER.info("CamouFlow server lifespan started")
+    try:
+        yield
+    finally:
+        if _flush_task is not None:
+            _flush_task.cancel()
+            try:
+                await _flush_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+            _flush_task = None
+        # Run browser cleanup off the uvicorn loop so Playwright session loops
+        # can drain without blocking the ASGI shutdown forever.
+        await asyncio.to_thread(shutdown_all_browsers, "lifespan shutdown")
+        LOGGER.info("CamouFlow server lifespan stopped")
+
+
+app = FastAPI(title="CamouFlow", lifespan=_app_lifespan)
+atexit.register(lambda: shutdown_all_browsers("atexit"))
 
 # --- proxy pool assignment ---
 _assigned_proxies: Dict[str, str] = {}  # profile_name -> proxy_value
@@ -536,28 +669,35 @@ def api_profile_start(name: str) -> JSONResponse:
                                browser_engine=engine, browser_settings=settings,
                                display=display_str or "")
     browser.add_close_callback(lambda: _on_browser_closed(name, browser))
-    _live_browsers[name] = {"browser": browser, "cdp_port": cdp_port, "engine": engine, "display": display_str, "vnc_port": vnc_info.get("vnc_port", 0) if vnc_info else 0, "ws_port": vnc_info.get("ws_port", 0) if vnc_info else 0}
+    with _live_browsers_lock:
+        _live_browsers[name] = {
+            "browser": browser,
+            "cdp_port": cdp_port,
+            "engine": engine,
+            "display": display_str,
+            "vnc_port": vnc_info.get("vnc_port", 0) if vnc_info else 0,
+            "ws_port": vnc_info.get("ws_port", 0) if vnc_info else 0,
+        }
     broadcast_log(f"Starting browser for {name} (CDP port {cdp_port})")
 
     def worker() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(browser.start())
+            # Dedicated long-lived loop inside BrowserInterface; do not close it here.
+            browser.run_coro(browser.start(), timeout=180.0)
         except Exception as exc:
             LOGGER.exception("Browser start failed for %s", name)
-            _on_browser_failed(name, browser, exc)
-        finally:
             try:
-                loop.close()
+                browser.shutdown_loop()
             except Exception:
                 pass
+            _on_browser_failed(name, browser, exc)
 
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=worker, name=f"browser-start-{name}", daemon=True).start()
     return JSONResponse({"ok": True, "status": "starting", "cdp_port": cdp_port, "cdp_url": f"http://127.0.0.1:{cdp_port}" if cdp_port else "", "headless": False, "vnc_port": vnc_info.get("vnc_port") if vnc_info else 0, "display": display_str})
 @app.post("/api/profiles/{name}/stop")
 def api_profile_stop(name: str) -> JSONResponse:
-    info = _live_browsers.get(name)
+    with _live_browsers_lock:
+        info = _live_browsers.get(name)
     if info is None:
         return JSONResponse({"ok": False, "error": "Not running"}, 404)
     browser = info.get("browser") if isinstance(info, dict) else info
@@ -566,12 +706,19 @@ def api_profile_stop(name: str) -> JSONResponse:
         return JSONResponse({"ok": False, "error": "Not running"}, 404)
 
     def worker() -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
         closed = False
         try:
-            loop.run_until_complete(browser.close(force=True))
-            closed = True
+            close_sync = getattr(browser, "close_sync", None)
+            if callable(close_sync):
+                closed = bool(close_sync(force=True, timeout=30.0, cdp_port=cdp_port))
+            else:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                try:
+                    loop.run_until_complete(browser.close(force=True))
+                    closed = True
+                finally:
+                    loop.close()
         except RuntimeError as exc:
             LOGGER.info("Browser %s close hit event-loop mismatch: %s", name, exc)
         except Exception:
@@ -584,10 +731,20 @@ def api_profile_stop(name: str) -> JSONResponse:
                     LOGGER.exception("Browser force kill failed for %s", name)
             if not closed:
                 broadcast_log(f"Cannot stop browser for {name}")
-                _live_browsers[name] = info
-            loop.close()
+                with _live_browsers_lock:
+                    if name not in _live_browsers:
+                        _live_browsers[name] = info
+            else:
+                # close callbacks normally remove the entry; ensure cleanup if not.
+                with _live_browsers_lock:
+                    current = _live_browsers.get(name)
+                    if current and (
+                        current is browser
+                        or (isinstance(current, dict) and current.get("browser") is browser)
+                    ):
+                        _live_browsers.pop(name, None)
 
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=worker, name=f"browser-stop-{name}", daemon=True).start()
     broadcast_log(f"Stopping browser for {name}")
     return JSONResponse({"ok": True})
 def api_profile_variables(name: str) -> JSONResponse:
@@ -618,8 +775,9 @@ def api_profile_variables_save(name: str, data: Dict[str, Any]) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 def _on_browser_failed(name: str, browser: Any, exc: Exception) -> None:
-    if (b := _live_browsers.get(name)) and b.get("browser") is browser:
-        _live_browsers.pop(name, None)
+    with _live_browsers_lock:
+        if (b := _live_browsers.get(name)) and b.get("browser") is browser:
+            _live_browsers.pop(name, None)
     try:
         get_virtual_display_manager().stop(name)
     except Exception:
@@ -636,8 +794,9 @@ def _on_browser_failed(name: str, browser: Any, exc: Exception) -> None:
     broadcast_log(f"Cannot start {name}: {exc}")
 
 def _on_browser_closed(name: str, browser: Any) -> None:
-    if (b := _live_browsers.get(name)) and b.get("browser") is browser:
-        _live_browsers.pop(name, None)
+    with _live_browsers_lock:
+        if (b := _live_browsers.get(name)) and b.get("browser") is browser:
+            _live_browsers.pop(name, None)
     try:
         get_virtual_display_manager().stop(name)
     except Exception:

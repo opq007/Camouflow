@@ -7,3 +7,4 @@ uvicorn[standard]
 websockets
 playwright==1.54.0
 websockify
+psutil>=5.9.0
