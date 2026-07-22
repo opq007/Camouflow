@@ -25,7 +25,13 @@ from app.storage.db import (
     profile_dir_for_email,
 )
 from .locale_mapping import country_to_locale
-from .proxy_utils import LocalSocksProxyServer, ProxyDetails, parse_proxy
+from .proxy_utils import (
+    LocalHttpProxyServer,
+    LocalProxyServer,
+    LocalSocksProxyServer,
+    ProxyDetails,
+    parse_proxy,
+)
 
 # Host process names we must never kill while cleaning up browser sessions.
 _HOST_PROCESS_NAMES = frozenset(
@@ -218,7 +224,7 @@ class BrowserInterface:
             msg = f"Proxy string provided for {self.profile_name} but failed to parse; proxy disabled"
             self.logger.warning(msg)
             self._proxy_logger.warning(msg)
-        self._local_proxy: Optional[LocalSocksProxyServer] = None
+        self._local_proxy: Optional[LocalProxyServer] = None
         self._process_watchdog_started = False
         # Long-lived asyncio loop: Playwright/Camoufox async objects must be closed
         # on the same loop that created them. Closing the loop right after start()
@@ -613,6 +619,70 @@ class BrowserInterface:
             return default
         return value if value > 0 else default
 
+    def _prepare_cloakbrowser_proxy(self) -> Optional[Dict[str, str]]:
+        """
+        Resolve the proxy object passed to CloakBrowser.
+
+        Chromium (CloakBrowser) does not reliably apply authenticated proxy
+        credentials: inline ``--proxy-server=user:pass@host`` and Playwright's
+        CDP 407 interceptor both frequently surface the interactive proxy auth
+        dialog. Camoufox/Firefox handles Playwright proxy auth better, so only
+        CloakBrowser is rewritten onto a local no-auth bridge that injects
+        credentials upstream.
+        """
+        if not self._proxy_config:
+            return None
+        if not self._proxy_details:
+            return self._proxy_config
+
+        details = self._proxy_details
+        scheme = (details.scheme or "").lower()
+        has_auth = bool(details.username)
+        if not has_auth:
+            self._proxy_logger.info(
+                "Using direct proxy for CloakBrowser %s: %s://%s:%s",
+                self.profile_name,
+                details.scheme,
+                details.host,
+                details.port,
+            )
+            return self._proxy_config
+
+        # Prefer a fresh local bridge per launch.
+        if self._local_proxy:
+            try:
+                self._local_proxy.stop()
+            except Exception:
+                pass
+            self._local_proxy = None
+
+        if scheme.startswith("socks"):
+            self._local_proxy = LocalSocksProxyServer(details, profile_name=self.profile_name)
+            proxy_url = self._local_proxy.start()
+            # Give the listener a moment before Chromium connects.
+            time.sleep(0.5)
+            self._proxy_logger.info(
+                "Using local SOCKS bridge for CloakBrowser %s via upstream %s://%s:%s",
+                self.profile_name,
+                details.scheme,
+                details.host,
+                details.port,
+            )
+            return {"server": proxy_url}
+
+        # HTTP(S) authenticated proxy -> local HTTP forwarder with preemptive auth.
+        self._local_proxy = LocalHttpProxyServer(details, profile_name=self.profile_name)
+        proxy_url = self._local_proxy.start()
+        time.sleep(0.2)
+        self._proxy_logger.info(
+            "Using local HTTP auth bridge for CloakBrowser %s via upstream %s://%s:%s",
+            self.profile_name,
+            details.scheme,
+            details.host,
+            details.port,
+        )
+        return {"server": proxy_url}
+
     def _build_cloakbrowser_launch_kwargs(self) -> Dict[str, object]:
         merged = dict(self._cloakbrowser_defaults or {})
         merged.update({k: v for k, v in (self._browser_settings or {}).items() if v is not None})
@@ -675,9 +745,11 @@ class BrowserInterface:
         if human_preset not in {"default", "careful"}:
             human_preset = "default"
 
+        proxy_for_launch = self._prepare_cloakbrowser_proxy()
+
         kwargs: Dict[str, object] = {
             "headless": self._browser_headless_value(merged.get("headless", False)),
-            "proxy": self._proxy_config,
+            "proxy": proxy_for_launch,
             "args": args,
             "locale": locale_value,
             "timezone": timezone_value,
@@ -884,11 +956,27 @@ class BrowserInterface:
 
         proxy_host = self._proxy_details.host
         proxy_port = int(self._proxy_details.port)
-        if getattr(self, "_local_proxy", None) and getattr(self._local_proxy, "port", None):
+        local_bridge = getattr(self, "_local_proxy", None)
+        local_port = getattr(local_bridge, "port", None) if local_bridge is not None else None
+        using_local = bool(local_port)
+        if using_local:
             proxy_host = "127.0.0.1"
-            proxy_port = int(self._local_proxy.port)
+            proxy_port = int(local_port)
 
         scheme = (self._proxy_details.scheme or "").lower()
+        # Local bridges never require credentials; auth is injected upstream.
+        if using_local and isinstance(local_bridge, LocalHttpProxyServer):
+            scheme = "http"
+            username = None
+            password = None
+        elif using_local and isinstance(local_bridge, LocalSocksProxyServer):
+            scheme = "socks5"
+            username = None
+            password = None
+        else:
+            username = self._proxy_details.username
+            password = self._proxy_details.password
+
         if scheme.startswith("socks"):
             proxy_type = socks.SOCKS4 if "4" in scheme else socks.SOCKS5
             original_socket = socket.socket
@@ -896,8 +984,8 @@ class BrowserInterface:
                 proxy_type,
                 proxy_host,
                 proxy_port,
-                username=self._proxy_details.username,
-                password=self._proxy_details.password,
+                username=username,
+                password=password,
             )
             socket.socket = socks.socksocket
             try:
@@ -906,9 +994,9 @@ class BrowserInterface:
                 socket.socket = original_socket
         else:
             auth = ""
-            if self._proxy_details.username:
-                user = urllib.parse.quote(self._proxy_details.username)
-                pwd = urllib.parse.quote(self._proxy_details.password or "")
+            if username:
+                user = urllib.parse.quote(username)
+                pwd = urllib.parse.quote(password or "")
                 auth = f"{user}:{pwd}@"
             proxy_url = f"{scheme or 'http'}://{auth}{proxy_host}:{proxy_port}"
             opener = urllib.request.build_opener(

@@ -1,11 +1,12 @@
+import base64
 import logging
 import select
 import socket
 import socketserver
 import threading
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Dict, Optional, Tuple, Union
+from urllib.parse import unquote, urlparse
 
 import socks
 
@@ -208,6 +209,279 @@ class SocksBridgeHandler(socketserver.StreamRequestHandler):
         upstream.close()
 
 
+class HttpBridgeHandler(socketserver.StreamRequestHandler):
+    """
+    Minimal local HTTP proxy (no auth) that injects upstream Proxy-Authorization
+    and tunnels CONNECT / absolute-form requests via the configured HTTP(S) proxy.
+
+    Chromium frequently fails to auto-apply proxy credentials (auth dialog / 407
+    on CONNECT). Pointing the browser at this local endpoint avoids that path.
+    """
+
+    timeout = 30
+
+    def handle(self):
+        try:
+            request_line = self._readline()
+            if not request_line:
+                return
+            headers = self._read_headers()
+            try:
+                method, target, version = request_line.split(" ", 2)
+            except ValueError:
+                self._send_simple_response(400, b"Bad Request")
+                return
+            method = method.upper()
+            if method == "CONNECT":
+                self._handle_connect(target, version, headers)
+            else:
+                self._handle_http(method, target, version, headers)
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            return
+        except OSError:
+            return
+        except Exception:
+            return
+
+    def _readline(self) -> str:
+        try:
+            raw = self.rfile.readline(65536)
+        except Exception:
+            return ""
+        if not raw:
+            return ""
+        return raw.decode("iso-8859-1", errors="replace").rstrip("\r\n")
+
+    def _read_headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        while True:
+            line = self._readline()
+            if line is None or line == "":
+                break
+            if ":" not in line:
+                continue
+            key, value = line.split(":", 1)
+            headers[key.strip().lower()] = value.strip()
+        return headers
+
+    def _proxy_auth_header(self) -> Optional[str]:
+        details: ProxyDetails = self.server.proxy_details
+        if not details.username:
+            return None
+        user = details.username
+        password = details.password or ""
+        token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+        return f"Proxy-Authorization: Basic {token}"
+
+    def _connect_upstream(self) -> Optional[socket.socket]:
+        details: ProxyDetails = self.server.proxy_details
+        try:
+            sock = socket.create_connection((details.host, details.port), timeout=15)
+            sock.settimeout(30)
+            return sock
+        except OSError:
+            return None
+
+    def _send_simple_response(self, status: int, body: bytes, reason: str = "") -> None:
+        reason = reason or {
+            200: "OK",
+            400: "Bad Request",
+            502: "Bad Gateway",
+            504: "Gateway Timeout",
+        }.get(status, "Error")
+        try:
+            self.connection.sendall(
+                f"HTTP/1.1 {status} {reason}\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n".encode("ascii")
+                + body
+            )
+        except Exception:
+            pass
+
+    def _handle_connect(self, target: str, version: str, headers: Dict[str, str]) -> None:
+        if ":" not in target:
+            self._send_simple_response(400, b"Bad CONNECT target")
+            return
+        host, _, port_raw = target.rpartition(":")
+        try:
+            port = int(port_raw)
+        except ValueError:
+            self._send_simple_response(400, b"Bad CONNECT port")
+            return
+        if not host or port <= 0:
+            self._send_simple_response(400, b"Bad CONNECT host")
+            return
+
+        upstream = self._connect_upstream()
+        if not upstream:
+            self._send_simple_response(502, b"Upstream proxy unreachable")
+            return
+
+        try:
+            lines = [f"CONNECT {host}:{port} HTTP/1.1", f"Host: {host}:{port}"]
+            auth = self._proxy_auth_header()
+            if auth:
+                lines.append(auth)
+            # Preemptive auth; do not forward browser Proxy-* headers.
+            for key, value in headers.items():
+                if key.startswith("proxy-"):
+                    continue
+                if key in {"host", "connection", "proxy-connection"}:
+                    continue
+                lines.append(f"{key}: {value}")
+            lines.append("Proxy-Connection: keep-alive")
+            lines.append("Connection: keep-alive")
+            payload = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1", errors="replace")
+            upstream.sendall(payload)
+
+            # Read upstream CONNECT response.
+            response = b""
+            while b"\r\n\r\n" not in response and len(response) < 65536:
+                chunk = upstream.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            if not response.startswith(b"HTTP/"):
+                self._send_simple_response(502, b"Invalid upstream CONNECT response")
+                upstream.close()
+                return
+            status_line = response.split(b"\r\n", 1)[0]
+            parts = status_line.split(b" ", 2)
+            try:
+                status_code = int(parts[1]) if len(parts) >= 2 else 502
+            except ValueError:
+                status_code = 502
+            if status_code != 200:
+                # Relay failure response to the browser (no interactive auth dialog for local proxy).
+                try:
+                    self.connection.sendall(response)
+                except Exception:
+                    pass
+                upstream.close()
+                return
+
+            try:
+                self.connection.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            except Exception:
+                upstream.close()
+                return
+            self._pipe(upstream)
+        except Exception:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    def _handle_http(self, method: str, target: str, version: str, headers: Dict[str, str]) -> None:
+        # Expect absolute-form URL from browser HTTP proxy clients.
+        parsed = urlparse(target)
+        if not parsed.scheme or not parsed.netloc:
+            self._send_simple_response(400, b"Absolute URL required")
+            return
+
+        upstream = self._connect_upstream()
+        if not upstream:
+            self._send_simple_response(502, b"Upstream proxy unreachable")
+            return
+
+        try:
+            path = parsed.path or "/"
+            if parsed.query:
+                path = f"{path}?{parsed.query}"
+            absolute = f"{parsed.scheme}://{parsed.netloc}{path}"
+            host_header = parsed.netloc
+            lines = [f"{method} {absolute} HTTP/1.1", f"Host: {host_header}"]
+            auth = self._proxy_auth_header()
+            if auth:
+                lines.append(auth)
+            content_length = 0
+            for key, value in headers.items():
+                if key.startswith("proxy-"):
+                    continue
+                if key in {"host", "connection", "proxy-connection", "proxy-authorization"}:
+                    continue
+                if key == "content-length":
+                    try:
+                        content_length = int(value)
+                    except ValueError:
+                        content_length = 0
+                lines.append(f"{key}: {value}")
+            lines.append("Connection: close")
+            header_blob = ("\r\n".join(lines) + "\r\n\r\n").encode("iso-8859-1", errors="replace")
+            upstream.sendall(header_blob)
+
+            remaining = content_length
+            while remaining > 0:
+                chunk = self.connection.recv(min(8192, remaining))
+                if not chunk:
+                    break
+                upstream.sendall(chunk)
+                remaining -= len(chunk)
+
+            # Stream the full upstream HTTP response back to the client.
+            while True:
+                data = upstream.recv(8192)
+                if not data:
+                    break
+                self.connection.sendall(data)
+        except Exception:
+            pass
+        finally:
+            try:
+                upstream.close()
+            except Exception:
+                pass
+
+    def _pipe(self, upstream: socket.socket):
+        client = self.connection
+        client.setblocking(False)
+        upstream.setblocking(False)
+        sockets = [client, upstream]
+        while True:
+            try:
+                readable, _, _ = select.select(sockets, [], [], 60)
+            except OSError:
+                break
+            if not readable:
+                continue
+            if client in readable:
+                try:
+                    data = client.recv(8192)
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    break
+                except OSError:
+                    break
+                if not data:
+                    break
+                try:
+                    upstream.sendall(data)
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    break
+                except OSError:
+                    break
+            if upstream in readable:
+                try:
+                    data = upstream.recv(8192)
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    break
+                except OSError:
+                    break
+                if not data:
+                    break
+                try:
+                    client.sendall(data)
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    break
+                except OSError:
+                    break
+        try:
+            upstream.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        upstream.close()
+
+
 class LocalSocksProxyServer:
     """
     Local SOCKS5 server without authentication that forwards through an upstream SOCKS proxy.
@@ -252,6 +526,50 @@ class LocalSocksProxyServer:
             self._thread = None
 
 
+class LocalHttpProxyServer:
+    """
+    Local HTTP proxy without authentication that injects upstream HTTP proxy credentials.
+    """
+
+    def __init__(self, details: ProxyDetails, profile_name: Optional[str] = None):
+        self._details = details
+        self._server: Optional[_ProxyTCPServer] = None
+        self._thread: Optional[threading.Thread] = None
+        self.port: Optional[int] = None
+        self._logger = logging.LoggerAdapter(LOGGER, {"profile": profile_name or "-"})
+
+    def start(self) -> str:
+        if self._server:
+            return f"http://127.0.0.1:{self.port}"
+        self._server = _ProxyTCPServer(("127.0.0.1", 0), HttpBridgeHandler, self._details)
+        self._server.logger = self._logger
+        self.port = self._server.server_address[1]
+        self._logger.info(
+            "Local HTTP proxy started on 127.0.0.1:%s (upstream %s://%s:%s)",
+            self.port,
+            self._details.scheme,
+            self._details.host,
+            self._details.port,
+        )
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        return f"http://127.0.0.1:{self.port}"
+
+    def stop(self):
+        if not self._server:
+            return
+        self._logger.info("Local proxy: stopping HTTP bridge on 127.0.0.1:%s", self.port)
+        self._server.shutdown()
+        self._server.server_close()
+        self._server = None
+        if self._thread:
+            self._thread.join(timeout=1)
+            self._thread = None
+
+
+LocalProxyServer = Union[LocalSocksProxyServer, LocalHttpProxyServer]
+
+
 def parse_proxy(proxy: str, profile_name: Optional[str] = None) -> Tuple[Optional[Dict[str, str]], Optional[ProxyDetails]]:
     """
     Convert proxy string formats into Playwright/Camoufox proxy configuration.
@@ -272,28 +590,39 @@ def parse_proxy(proxy: str, profile_name: Optional[str] = None) -> Tuple[Optiona
     def _warn(reason: str):
         return
 
+    def _decode_cred(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        # urlparse leaves percent-encoding in place; credentials must be decoded once.
+        return unquote(value)
+
     def _build(scheme: str, host: str, port: str, username: Optional[str], password: Optional[str]):
         server = f"{scheme}://{host}:{port}"
         cfg: Dict[str, str] = {"server": server}
         if username:
             cfg["username"] = username
-        if password:
+        if password is not None and password != "":
             cfg["password"] = password
+        elif username and password == "":
+            # Explicit empty password still needs a key for some engines.
+            cfg["password"] = ""
         return cfg
 
     if "@" in raw:
-        parsed = urlparse(raw)
+        parsed = urlparse(raw if "://" in raw else f"http://{raw}")
         if not parsed.scheme or not parsed.hostname or not parsed.port:
             _warn("invalid url-like proxy string")
             return None, None
+        username = _decode_cred(parsed.username)
+        password = _decode_cred(parsed.password)
         details = ProxyDetails(
             scheme=parsed.scheme,
             host=parsed.hostname,
             port=int(parsed.port),
-            username=parsed.username,
-            password=parsed.password,
+            username=username,
+            password=password,
         )
-        return _build(parsed.scheme, parsed.hostname, str(parsed.port), parsed.username, parsed.password), details
+        return _build(parsed.scheme, parsed.hostname, str(parsed.port), username, password), details
 
     try:
         scheme, rest = raw.split("://", 1)
