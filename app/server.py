@@ -13,8 +13,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.core.virtual_display import get_virtual_display_manager
@@ -1006,6 +1006,83 @@ def api_logs_get() -> JSONResponse:
 def api_logs_clear() -> JSONResponse:
     _log_messages.clear()
     return JSONResponse({"ok": True})
+
+# ============================================================
+# Migration (profiles + proxies + fingerprints ZIP)
+# ============================================================
+
+@app.get("/api/migration/export")
+def api_migration_export(
+    scope: str = "full",
+    names: str = "",
+    stage: str = "",
+    pool_names: str = "",
+) -> Response:
+    """Download a migration ZIP (profiles / proxies / full)."""
+    from app.storage.migration import build_export_zip
+
+    name_list = [p.strip() for p in names.split(",") if p.strip()] if names else None
+    pool_list = [p.strip() for p in pool_names.split(",") if p.strip()] if pool_names else None
+    try:
+        zip_bytes, filename, manifest = build_export_zip(
+            scope=scope,
+            names=name_list,
+            stage=stage,
+            pool_names=pool_list,
+        )
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, 400)
+    except Exception as exc:
+        LOGGER.exception("Migration export failed")
+        return JSONResponse({"ok": False, "error": f"Export failed: {exc}"}, 500)
+
+    warn_n = len(manifest.get("warnings") or [])
+    broadcast_log(
+        f"Migration export ({scope}): "
+        f"{len(manifest.get('profiles') or [])} profile(s), "
+        f"{len(manifest.get('proxy_pools') or [])} pool(s)"
+        + (f", {warn_n} warning(s)" if warn_n else "")
+    )
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Migration-Warnings": str(warn_n),
+        },
+    )
+
+
+@app.post("/api/migration/import")
+async def api_migration_import(
+    file: UploadFile = File(...),
+    force_overwrite: str = Form("false"),
+) -> JSONResponse:
+    """Import a migration ZIP package."""
+    from app.storage.migration import import_migration_zip
+
+    force = str(force_overwrite or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    try:
+        raw = await file.read()
+    except Exception as exc:
+        return JSONResponse({"ok": False, "error": f"Failed to read upload: {exc}"}, 400)
+    try:
+        result = import_migration_zip(raw, force_overwrite=force)
+    except ValueError as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, 400)
+    except Exception as exc:
+        LOGGER.exception("Migration import failed")
+        return JSONResponse({"ok": False, "error": f"Import failed: {exc}"}, 500)
+
+    p = result.get("profiles") or {}
+    broadcast_log(
+        "Migration import: "
+        f"+{p.get('added', 0)} profile(s), "
+        f"skip {p.get('skipped', 0)}, "
+        f"overwrite {p.get('overwritten', 0)}"
+    )
+    return JSONResponse(result)
+
 
 # ============================================================
 # Settings

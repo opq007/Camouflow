@@ -77,11 +77,16 @@
       <div id="profiles-stage-filter" class="btn-group" style="margin-bottom:16px"></div>
       <div class="btn-group" style="margin-bottom:16px">
         <button class="btn btn-primary" onclick="profilesCreate()">+ New Profile</button>
-        <button class="btn" onclick="profilesImportShow()">Import Profiles</button>
+        <button class="btn" onclick="profilesImportShow()">Import from text</button>
+        <button class="btn" onclick="migrationExportProfiles()">Export ZIP</button>
+        <button class="btn" onclick="migrationImportShow('profiles')">Import ZIP</button>
         <button class="btn btn-ghost" onclick="profilesRefresh()">Refresh</button>
       </div>
       <div class="card"><div class="table-wrap">
-        <table><thead><tr><th>Name</th><th>ID</th><th>Browser</th><th>Proxy</th><th>Stage</th><th>Status</th><th>Actions</th></tr></thead>
+        <table><thead><tr>
+          <th style="width:36px"><input type="checkbox" id="profiles-select-all" title="Select all" onchange="profilesToggleSelectAll(this)"></th>
+          <th>Name</th><th>ID</th><th>Browser</th><th>Proxy</th><th>Stage</th><th>Status</th><th>Actions</th>
+        </tr></thead>
         <tbody id="profiles-table"></tbody></table>
       </div></div>
     </div>
@@ -101,6 +106,8 @@
       <div class="page-header"><h1>Proxies</h1><p>Manage proxy pools and assignments</p></div>
       <div class="btn-group" style="margin-bottom:16px">
         <button class="btn btn-primary" onclick="proxiesPoolCreate()">+ New Pool</button>
+        <button class="btn" onclick="migrationExportProxies()">Export ZIP</button>
+        <button class="btn" onclick="migrationImportShow('proxies')">Import ZIP</button>
         <button class="btn btn-ghost" onclick="proxiesRefresh()">Refresh</button>
       </div>
       <div id="proxies-pools"></div>
@@ -122,6 +129,17 @@
       <div class="card"><div id="settings-form"></div>
         <div class="btn-group" style="margin-top:16px">
           <button class="btn btn-primary" onclick="settingsSave()">Save Settings</button>
+        </div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <div class="card-title">Migration</div>
+        <p style="color:var(--text-secondary);font-size:13px;margin-bottom:12px">
+          Export or import a ZIP package with profiles, proxy pools, and fingerprint files
+          (no cookies / browser user data). Use this to move configurations between machines.
+        </p>
+        <div class="btn-group">
+          <button class="btn btn-primary" onclick="migrationExportFull()">Export all</button>
+          <button class="btn" onclick="migrationImportShow('full')">Import all</button>
         </div>
       </div>
     </div>

@@ -29,14 +29,25 @@ function toast(msg) {
 }
 
 // ========== Modal ==========
-function showModal(title, bodyHtml, onSave) {
+function showModal(title, bodyHtml, onSave, options) {
+  const opts = options || {};
   const modal = document.getElementById('modal');
   const content = document.getElementById('modal-content');
+  const saveLabel = opts.saveLabel || 'Save';
   content.innerHTML = '<h2>' + title + '</h2>' + bodyHtml +
     '<div class="modal-footer">' +
     '<button class="btn btn-ghost" onclick="closeModal()">Cancel</button>' +
-    '<button class="btn btn-primary" id="modal-save">Save</button></div>';
-  document.getElementById('modal-save').addEventListener('click', () => { onSave(); closeModal(); });
+    '<button class="btn btn-primary" id="modal-save">' + saveLabel + '</button></div>';
+  document.getElementById('modal-save').addEventListener('click', async () => {
+    try {
+      const result = onSave && onSave();
+      if (result && typeof result.then === 'function') await result;
+      if (opts.closeOnSave === false) return;
+      closeModal();
+    } catch (e) {
+      toast(String(e && e.message ? e.message : e));
+    }
+  });
   modal.classList.add('show');
 }
 function closeModal() { document.getElementById('modal').classList.remove('show'); }
@@ -115,11 +126,14 @@ async function profilesFilter(btn) {
 }
 function renderProfilesTable(rows) {
   const tbody = document.getElementById('profiles-table');
+  const selectAll = document.getElementById('profiles-select-all');
+  if (selectAll) selectAll.checked = false;
   tbody.innerHTML = rows.map(r => {
     const cdpInfo = r.running && r.cdp_url
       ? `<a href="${r.cdp_url}" target="_blank" class="tag" style="background:rgba(6,182,212,0.18);color:#67e8f9;text-decoration:none;cursor:pointer" title="Open CDP DevTools">CDP :${r.cdp_port}</a>` + (r.vnc_port ? ` <a href="/static/vnc_viewer.html?host=${location.hostname}&port=${r.ws_port}&profile=${encodeURIComponent(r.name)}" target="_blank" class="tag" style="background:rgba(168,85,247,0.18);color:#c084fc;text-decoration:none;cursor:pointer" title="Remote view via VNC">View</a>` : "")
       : '';
     return `<tr>
+    <td><input type="checkbox" class="profile-select" value="${escHtml(r.name)}"></td>
     <td><strong>${escHtml(r.name)}</strong>${cdpInfo}</td>
     <td class="id-col">${escHtml(r.id)}</td>
     <td>${escHtml(r.browser)}</td>
@@ -132,6 +146,16 @@ function renderProfilesTable(rows) {
       <button class="btn btn-sm btn-danger" onclick="profilesDelete('${escJs(r.name)}')">Delete</button>
     </td></tr>`;
   }).join('');
+}
+function profilesToggleSelectAll(el) {
+  document.querySelectorAll('.profile-select').forEach(cb => { cb.checked = !!el.checked; });
+}
+function profilesSelectedNames() {
+  return Array.from(document.querySelectorAll('.profile-select:checked')).map(cb => cb.value).filter(Boolean);
+}
+function profilesActiveStage() {
+  const btn = document.querySelector('#profiles-stage-filter .btn.active');
+  return btn ? (btn.dataset.stage || '') : '';
 }
 async function profilesCreate() { const r = await apiPost('/profiles/create'); if (r.ok) { toast('Profile created'); loadProfiles(); } }
 function profilesRefresh() { loadProfiles(); }
@@ -350,13 +374,124 @@ async function loadSettings() {
     <div class="form-group"><label>UI Theme</label><select id="set-theme"><option>premium_dark</option></select></div>
     <div class="form-group"><label>Account Parse Template</label><input id="set-template" value="${escHtml(s.account_parse_template||'')}"></div>
     <div class="card-title">About</div>
-    <p style="color:var(--text-secondary)">CamouFlow v2.0.0 鈥?HTML UI</p>
+    <p style="color:var(--text-secondary)">CamouFlow v2.0.0 — HTML UI</p>
     <p style="color:var(--text-muted);font-size:12px">Running on <code>${location.host}</code></p>
   `;
 }
 async function settingsSave() {
   await apiPut('/settings', { data_root: g('set-data-root'), ui_theme: g('set-theme'), account_parse_template: g('set-template') });
   toast('Settings saved');
+}
+
+// ===== MIGRATION (ZIP import / export) =====
+function migrationFilenameFromDisposition(header) {
+  if (!header) return 'camouflow-migration.zip';
+  const m = /filename\*?=(?:UTF-8''|")?([^\";]+)/i.exec(header);
+  if (!m) return 'camouflow-migration.zip';
+  try { return decodeURIComponent(m[1].replace(/"/g, '').trim()); } catch (e) { return m[1].replace(/"/g, '').trim(); }
+}
+
+async function migrationDownload(params) {
+  const qs = new URLSearchParams();
+  Object.keys(params || {}).forEach(k => {
+    const v = params[k];
+    if (v !== undefined && v !== null && String(v) !== '') qs.set(k, String(v));
+  });
+  const url = API + '/migration/export?' + qs.toString();
+  const r = await fetch(url);
+  if (!r.ok) {
+    let err = 'Export failed';
+    try { const j = await r.json(); err = j.error || err; } catch (e) {}
+    toast(err);
+    return;
+  }
+  const blob = await r.blob();
+  const filename = migrationFilenameFromDisposition(r.headers.get('Content-Disposition'));
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+  toast('Export downloaded: ' + filename);
+}
+
+function migrationExportFull() {
+  migrationDownload({ scope: 'full' });
+}
+
+function migrationExportProfiles() {
+  const selected = profilesSelectedNames();
+  const stage = profilesActiveStage();
+  const params = { scope: 'profiles' };
+  if (selected.length) {
+    params.names = selected.join(',');
+  } else if (stage) {
+    params.stage = stage;
+  }
+  migrationDownload(params);
+}
+
+function migrationExportProxies() {
+  migrationDownload({ scope: 'proxies' });
+}
+
+function migrationImportShow(context) {
+  const title = context === 'full'
+    ? 'Import migration package (all)'
+    : (context === 'proxies' ? 'Import proxies ZIP' : 'Import profiles ZIP');
+  showModal(title, `
+    <p style="color:var(--text-secondary);font-size:13px;margin-bottom:12px">
+      Upload a CamouFlow migration ZIP. Package may contain proxy passwords and account fields.
+      Fingerprints are restored when present; cookies / browser user data are not included.
+    </p>
+    <div class="form-group"><label>Migration ZIP</label><input type="file" id="mig-file" accept=".zip,application/zip"></div>
+    <div class="form-group">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="mig-force" style="width:auto">
+        Force overwrite existing profiles (and their fingerprint files)
+      </label>
+    </div>
+    <div id="mig-result" style="font-size:12px;color:var(--text-muted);margin-top:8px;white-space:pre-wrap"></div>
+  `, async () => {
+    const input = document.getElementById('mig-file');
+    const file = input && input.files && input.files[0];
+    if (!file) { toast('Choose a ZIP file first'); return; }
+    const force = document.getElementById('mig-force')?.checked ? 'true' : 'false';
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('force_overwrite', force);
+    const resultEl = document.getElementById('mig-result');
+    const r = await fetch(API + '/migration/import', { method: 'POST', body: fd });
+    const data = await r.json();
+    if (!r.ok || data.ok === false) {
+      const err = data.error || 'Import failed';
+      if (resultEl) resultEl.textContent = err;
+      toast(err);
+      return;
+    }
+    const p = data.profiles || {};
+    const x = data.proxies || {};
+    const f = data.fingerprints || {};
+    const summary = [
+      'Profiles: +' + (p.added || 0) + ' added, ' + (p.skipped || 0) + ' skipped, ' + (p.overwritten || 0) + ' overwritten',
+      'Proxies: ' + (x.pools_created || 0) + ' pools created, ' + (x.pools_merged || 0) + ' merged, +' + (x.proxies_added || 0) + ' proxies (' + (x.proxies_deduped || 0) + ' dupes)',
+      'Fingerprints written: ' + (f.written || 0) + ', skipped: ' + (f.skipped || 0),
+    ];
+    if (p.errors && p.errors.length) summary.push('Errors: ' + p.errors.join('; '));
+    if (data.warnings && data.warnings.length) summary.push('Warnings: ' + data.warnings.slice(0, 5).join('; '));
+    if (resultEl) resultEl.textContent = summary.join('\n');
+    toast(
+      'Import: +' + (p.added || 0) + ' profiles, ' +
+      (p.skipped || 0) + ' skipped, ' +
+      (p.overwritten || 0) + ' overwritten; ' +
+      'fp ' + (f.written || 0)
+    );
+    stateCache.proxyPools = null;
+    if (currentPage === 'profiles') loadProfiles();
+    else if (currentPage === 'proxies') loadProxies();
+    else if (currentPage === 'dashboard') loadDashboard();
+  }, { saveLabel: 'Import', closeOnSave: false });
 }
 
 // ========== Helpers ==========

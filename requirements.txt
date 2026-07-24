@@ -3,6 +3,7 @@ cloakbrowser
 PySocks
 PyInstaller
 fastapi
+python-multipart
 uvicorn[standard]
 websockets
 playwright==1.54.0
